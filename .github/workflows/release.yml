@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # The path of the two Rust projects
-      WEBSERVER_PATH: src/webserver
+      WEBSERVER_PATH: src/aika-node
       DEPLOY_PATH: src/deploy
 
       # Specify what target to build for, we only need linux
@@ -92,7 +92,7 @@ jobs:
             ${{ env.WEBSERVER_PATH }}
             ${{ env.DEPLOY_PATH }}
 
-      - name: Build webserver
+      - name: Build aika-node
         run: |
           cargo build \
             --manifest-path ${{ env.WEBSERVER_PATH }}/Cargo.toml \
