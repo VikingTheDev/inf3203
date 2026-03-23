@@ -4,3 +4,37 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Async runtime — drives all async tasks, timers, and I/O
+tokio = { version = "1", features = ["full"] }
+
+# Serialization for RPC messages sent over the network
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random election timeout generation (to reduce split votes)
+rand = "0.9"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Ergonomic error types via derive macros
+thiserror = "2"
+
+# Async fn in trait definitions (stabilised in Rust 1.75 via RPITIT, but
+# async-trait is kept here for object-safe trait usage where needed)
+async-trait = "0.1"
+
+# HTTP server for Raft RPCs and the client/debug API
+axum = "0.8"
+
+# CLI argument parsing for --id, --port, --peers, etc.
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client used by the RaftTransport implementation to send RPCs to peers
+reqwest = { version = "0.12", features = ["json"] }
+anyhow = "1.0.102"
+
+[dev-dependencies]
+# Temporary directories for storage in tests
+tempfile = "3"

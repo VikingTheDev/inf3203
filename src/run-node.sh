@@ -33,6 +33,7 @@ fi
 # --- workspace & cleanup ---
 WORKDIR="$(mktemp -d)"
 TARBALL="$WORKDIR/binary.tar.gz"
+# Cleanup function that removes the temporary directory and its contents when the script exits
 cleanup() { rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 
@@ -55,8 +56,13 @@ tar -xzf "$TARBALL" -C "$WORKDIR"
 BINPATH="$WORKDIR/$BIN"
 chmod +x "$BINPATH"
 
+# Create a symlink with inf3203_ prefix for the process name
+BINNAME=$(basename "$BINPATH")
+PREFIXED_BINPATH="$WORKDIR/inf3203_${BINNAME}"
+ln -s "$BINPATH" "$PREFIXED_BINPATH"
+
 echo "Starting webserver on port ${NODE}:${PORT} as background process"
-nohup "$BINPATH" "$NODE" "$PORT" &> /dev/null &
+nohup "$PREFIXED_BINPATH" "$NODE" "$PORT" &> /dev/null &
 
 # Wait, and then hit the /helloworld endpoint to verify it's running
 sleep 2

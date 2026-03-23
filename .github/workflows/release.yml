@@ -2,7 +2,9 @@ name: release-linux
 
 # Workflow created using ChatGPT 5 Thinking
 # https://chatgpt.com/share/68bd99e8-9fac-800d-b946-7a522a655bda
-# Some modifications had to be made to make it work
+# Some modifications had to be made to make it work for our purpose
+# Claude Code (Sonnet 4) was used to troubleshoot and change the workflow to use musl for static linking.
+# Claude Code was also used to add the version injection step.
 
 permissions:
   contents: write  # To create releases
