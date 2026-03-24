@@ -41,9 +41,6 @@ pub struct HttpTransport<C> {
     /// Peers whose outgoing RPCs are currently blocked (partition simulation).
     blocked_peers: Arc<Mutex<HashSet<NodeId>>>,
 
-    /// How long to wait for a response before returning `TransportError::Timeout`.
-    rpc_timeout: Duration,
-
     /// Underlying HTTP client (reused across calls for connection pooling).
     client: reqwest::Client,
 
@@ -77,7 +74,6 @@ where
             own_id,
             peer_urls,
             blocked_peers,
-            rpc_timeout,
             client,
             _phantom: std::marker::PhantomData,
         }
@@ -98,10 +94,12 @@ where
     }
 
     /// Map a `reqwest::Error` to a `TransportError`.
-    fn map_err(peer: &NodeId, e: reqwest::Error) -> TransportError {
+    fn map_err(&self, peer: &NodeId, e: reqwest::Error) -> TransportError {
         if e.is_timeout() {
+            warn!(own_id = %self.own_id, peer = %peer, "RPC timed out");
             TransportError::Timeout
         } else {
+            warn!(own_id = %self.own_id, peer = %peer, err = %e, "RPC failed");
             TransportError::Other(format!("HTTP error to {peer}: {e}"))
         }
     }
@@ -130,11 +128,11 @@ where
             .json(&args)
             .send()
             .await
-            .map_err(|e| Self::map_err(peer, e))?
+            .map_err(|e| self.map_err(peer, e))?
             .json::<RequestVoteReply>()
             .await
             .map_err(|e| {
-                warn!(peer = %peer, err = %e, "failed to parse RequestVoteReply");
+                warn!(own_id = %self.own_id, peer = %peer, err = %e, "failed to parse RequestVoteReply");
                 TransportError::Other(e.to_string())
             })
     }
@@ -153,11 +151,11 @@ where
             .json(&args)
             .send()
             .await
-            .map_err(|e| Self::map_err(peer, e))?
+            .map_err(|e| self.map_err(peer, e))?
             .json::<AppendEntriesReply>()
             .await
             .map_err(|e| {
-                warn!(peer = %peer, err = %e, "failed to parse AppendEntriesReply");
+                warn!(own_id = %self.own_id, peer = %peer, err = %e, "failed to parse AppendEntriesReply");
                 TransportError::Other(e.to_string())
             })
     }

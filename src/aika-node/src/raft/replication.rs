@@ -33,17 +33,12 @@ pub struct ReplicationConfig {
     /// How often the leader sends heartbeats when there is nothing new to
     /// replicate.  Must be well below the election timeout minimum.
     pub heartbeat_interval: Duration,
-
-    /// How long to wait for an `AppendEntries` reply before considering the
-    /// RPC lost and retrying.
-    pub append_entries_timeout: Duration,
 }
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
         ReplicationConfig {
             heartbeat_interval: Duration::from_millis(50),
-            append_entries_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -268,16 +263,19 @@ where
         return Ok(());
     }
 
-    // Backtrack next_index: jump to conflict_index if provided, else decrement by 1.
+    // Fast log backtracking: the follower already computed the right index to
+    // jump to (`conflict_index`).  Use it directly instead of decrementing
+    // one step at a time.  `conflict_term` was used by the follower to find
+    // that index; the leader doesn't need to re-derive it.
+    // Falls back to decrement-by-one when no hint is available.
     {
         let mut state_guard = state.lock().await;
         if let Some(ref mut leader_state) = state_guard.leader_state {
             if let Some(peer_state) = leader_state.peers.get_mut(peer) {
-                if let Some(conflict_index) = reply.conflict_index {
-                    peer_state.next_index = conflict_index;
-                } else if peer_state.next_index > 1 {
-                    peer_state.next_index -= 1;
-                }
+                peer_state.next_index = match reply.conflict_index {
+                    Some(ci) => ci.max(1),
+                    None => peer_state.next_index.saturating_sub(1).max(1),
+                };
             }
         }
     }
@@ -477,7 +475,7 @@ pub async fn apply_committed_entries<C>(
         let mut entries = Vec::new();
         for idx in (last_applied + 1)..=commit_index {
             if let Some(entry) = log_guard.get(idx) {
-                entries.push((idx, entry.term, entry.command.clone()));
+                entries.push((idx, entry.command.clone()));
             }
         }
 
@@ -487,13 +485,9 @@ pub async fn apply_committed_entries<C>(
     };
 
     // Send each entry on the apply channel (no locks held).
-    for (index, term, command) in entries_to_apply {
+    for (index, command) in entries_to_apply {
         if let Err(e) = apply_tx
-            .send(super::ApplyMsg::Command {
-                index,
-                term,
-                command,
-            })
+            .send(super::ApplyMsg::Command { index, command })
             .await
         {
             warn!("failed to send ApplyMsg for index {index}: {e}");
@@ -620,7 +614,25 @@ where
         }
 
         // 6. Append entries from leader.
+        let had_new_entries = !args.entries.is_empty();
         log_guard.append_entries_from_leader(args.prev_log_index, args.entries);
+
+        // Persist the updated log before advancing commit_index.
+        // Raft §8: a follower must durably record entries before acknowledging
+        // AppendEntries, so a crash-restart cannot lose entries the leader
+        // believes are safely replicated.
+        if had_new_entries {
+            let all_entries = log_guard.entries_from(1);
+            if let Err(e) = storage.save_log(&all_entries) {
+                warn!("follower log persist failed: {e}");
+                return AppendEntriesReply {
+                    term: current_term,
+                    success: false,
+                    conflict_index: None,
+                    conflict_term: None,
+                };
+            }
+        }
 
         // 7. Advance commit_index.
         let last_new_entry_index = log_guard.last_index();

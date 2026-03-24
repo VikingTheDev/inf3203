@@ -19,7 +19,7 @@ use std::time::Duration;
 use rand::Rng;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{
     RaftError,
@@ -41,9 +41,6 @@ pub struct ElectionConfig {
 
     /// Maximum election timeout (random value chosen in `[min, max)`).
     pub timeout_max: Duration,
-
-    /// How long to wait for a `RequestVote` reply before considering it lost.
-    pub vote_rpc_timeout: Duration,
 }
 
 impl Default for ElectionConfig {
@@ -51,7 +48,6 @@ impl Default for ElectionConfig {
         ElectionConfig {
             timeout_min: Duration::from_millis(150),
             timeout_max: Duration::from_millis(300),
-            vote_rpc_timeout: Duration::from_millis(100),
         }
     }
 }

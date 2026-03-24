@@ -199,13 +199,6 @@ impl RaftState {
     pub fn is_leader(&self) -> bool {
         self.role == Role::Leader
     }
-
-    /// Return the term of the last entry in the log, or 0 if the log is empty.
-    ///
-    /// Requires access to `RaftLog`; callers pass in the term from there.
-    pub fn last_log_term(&self, last_log_entry_term: Term) -> Term {
-        last_log_entry_term
-    }
 }
 
 // endregion

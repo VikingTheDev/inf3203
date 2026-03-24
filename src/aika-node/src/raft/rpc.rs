@@ -115,9 +115,6 @@ pub enum TransportError {
     #[error("RPC timed out")]
     Timeout,
 
-    #[error("serialization error: {0}")]
-    Serialization(String),
-
     #[error("transport error: {0}")]
     Other(String),
 }

@@ -14,11 +14,13 @@ use storage::RaftStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::common::Command;
+use election::{ElectionConfig, ElectionTimer};
 use http_transport::HttpTransport;
 use log::RaftLog;
+use replication::ReplicationConfig;
 use state::{LogIndex, NodeId, RaftState, Term};
 
 /// A committed log entry delivered to the application state machine.
@@ -26,11 +28,7 @@ use state::{LogIndex, NodeId, RaftState, Term};
 /// Produced by the Raft core once an entry reaches commit quorum; consumed
 /// by the task that drives `StateMachine::apply`.
 pub enum ApplyMsg<C> {
-    Command {
-        index: LogIndex,
-        term: Term,
-        command: C,
-    },
+    Command { index: LogIndex, command: C },
 }
 
 /// Errors that can occur during Raft operations (e.g. proposing a command).
@@ -61,9 +59,6 @@ pub struct RaftNode {
     /// Replicated log, shared across all tasks.
     log: Arc<Mutex<RaftLog<Command>>>,
 
-    /// HTTP transport for sending `RequestVote` / `AppendEntries` RPCs.
-    transport: Arc<HttpTransport<Command>>,
-
     /// Maps each peer's `NodeId` (its address string) to a stable `u64`
     /// so that `leader_info` can return a numeric ID for any leader.
     ///
@@ -84,6 +79,14 @@ pub struct RaftNode {
 
     /// Persistent storage handle — used to durably save term/vote and log.
     storage: Arc<RaftStorage>,
+
+    /// Sender end of the committed-entry channel.  Used internally by
+    /// `handle_append_entries` to route follower-applied entries into the
+    /// same state machine pipeline as leader commits.
+    apply_tx: mpsc::Sender<ApplyMsg<Command>>,
+
+    /// Election timer — reset on every valid heartbeat and vote grant.
+    timer: Arc<ElectionTimer>,
 }
 
 impl RaftNode {
@@ -136,30 +139,203 @@ impl RaftNode {
             *raft_log.blocking_lock() = RaftLog::from_entries(entries);
         }
 
-        let (propose_tx, _propose_rx) = mpsc::channel(64);
+        // --- Channel setup ---------------------------------------------------
+        // propose_rx must be moved into the event loop (Receiver is not Clone).
+        let (propose_tx, mut propose_rx) =
+            mpsc::channel::<(Command, tokio::sync::oneshot::Sender<anyhow::Result<()>>)>(64);
 
-        // TODO: Spawn the main Raft event loop.  It should:
-        //   1. Start an ElectionTimer (election::ElectionTimer::start).
-        //   2. Pass Arc<RaftStorage> into the loop so mutation helpers can call
-        //      storage.save_persistent_state() and storage.save_log() as needed.
-        //   3. Loop selecting on:
-        //      - Election timeout  → election::start_election(...)
-        //      - Vote result       → election::handle_vote_response(...)
-        //      - Majority won      → election::become_leader(...)
-        //      - Propose request   → append to log, replicate, await commit,
-        //                           reply on the oneshot channel.
-        //   4. On commit, invoke each callback in commit_callbacks.
-        //   5. Keep _propose_rx alive inside the spawned task.
+        // Committed entries flow: replication/follower code → apply_tx → event loop.
+        let (apply_tx, mut apply_rx) = mpsc::channel::<ApplyMsg<Command>>(256);
+
+        // Election timer fires on this channel to trigger a new election.
+        let (election_timeout_tx, mut election_timeout_rx) = mpsc::channel::<()>(1);
+
+        // Vote replies from concurrent RequestVote RPCs arrive here.
+        let (vote_reply_tx, mut vote_reply_rx) =
+            mpsc::channel::<(NodeId, Term, rpc::RequestVoteReply)>(32);
+
+        // Replication tasks signal here when a peer's match_index advances.
+        let commit_notify = Arc::new(Notify::new());
+
+        // --- Election timer --------------------------------------------------
+        let timer = Arc::new(ElectionTimer::start(
+            ElectionConfig::default(),
+            election_timeout_tx,
+        ));
+
+        // --- Commit callbacks (created before event loop so both sides can hold it) ---
+        type CbVec = Vec<Box<dyn Fn(Command) + Send + 'static>>;
+        let commit_callbacks: Arc<std::sync::Mutex<CbVec>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // --- Clone arcs for the event loop task ------------------------------
+        let el_state = Arc::clone(&raft_state);
+        let el_log = Arc::clone(&raft_log);
+        let el_transport = Arc::clone(&transport);
+        let el_storage = Arc::clone(&storage);
+        let el_callbacks = Arc::clone(&commit_callbacks);
+        let el_apply_tx = apply_tx.clone();
+        let el_commit_notify = Arc::clone(&commit_notify);
+        let el_timer = Arc::clone(&timer);
+
+        // --- Raft event loop -------------------------------------------------
+        // Single-task serialises: elections, vote counting, proposals, commits.
+        // Lock ordering everywhere: state first, then log — never reversed.
+        tokio::spawn(async move {
+            // How many nodes (including self) are in the cluster?
+            let cluster_size = el_state.lock().await.peers.len() + 1;
+
+            // Proposals waiting for their log entry to be committed.
+            // Key = log index assigned when the entry was appended.
+            let mut pending: HashMap<LogIndex, tokio::sync::oneshot::Sender<anyhow::Result<()>>> =
+                HashMap::new();
+
+            // Votes accumulated in the current election (self-vote already counted).
+            let mut votes_received: usize = 0;
+
+            // Wakes per-peer replication tasks when a new entry is appended.
+            let mut entry_notify: Option<Arc<Notify>> = None;
+
+            // Signals replication tasks to stop (closed when stepping down).
+            let mut shutdown_tx: Option<tokio::sync::watch::Sender<bool>> = None;
+
+            loop {
+                tokio::select! {
+                    // ── Apply a committed entry ───────────────────────────────
+                    // Complete any pending proposal at this log index and invoke
+                    // commit callbacks so the state machine can apply the command.
+                    Some(msg) = apply_rx.recv() => {
+                        let ApplyMsg::Command { index, command } = msg;
+                        if let Some(reply_tx) = pending.remove(&index) {
+                            let _ = reply_tx.send(Ok(()));
+                        }
+                        // Callbacks are Fn (sync), so we hold the std::sync::Mutex
+                        // briefly — no await inside the lock.
+                        let cbs = el_callbacks.lock().expect("commit_callbacks poisoned");
+                        for cb in cbs.iter() {
+                            cb(command.clone());
+                        }
+                    }
+
+                    // ── Replication task advanced a match_index ───────────────
+                    // Re-evaluate which entries can now be committed.
+                    _ = el_commit_notify.notified() => {
+                        replication::advance_commit_index(
+                            Arc::clone(&el_state),
+                            Arc::clone(&el_log),
+                            el_apply_tx.clone(),
+                        ).await;
+                    }
+
+                    // ── Election timer fired ──────────────────────────────────
+                    Some(()) = election_timeout_rx.recv() => {
+                        votes_received = 1; // self-vote is implicit in start_election
+                        let _ = election::start_election(
+                            Arc::clone(&el_state),
+                            Arc::clone(&el_log),
+                            Arc::clone(&el_transport),
+                            Arc::clone(&el_storage),
+                            &*el_timer,
+                            vote_reply_tx.clone(),
+                        ).await;
+                    }
+
+                    // ── Vote reply from a peer ────────────────────────────────
+                    Some((peer, election_term, reply)) = vote_reply_rx.recv() => {
+                        let won = election::handle_vote_response(
+                            Arc::clone(&el_state),
+                            Arc::clone(&el_storage),
+                            peer,
+                            election_term,
+                            reply,
+                            &mut votes_received,
+                            cluster_size,
+                        ).await;
+
+                        if won {
+                            votes_received = 0;
+
+                            // Stop any still-running replication tasks from the
+                            // previous leadership term.
+                            if let Some(tx) = shutdown_tx.take() {
+                                let _ = tx.send(true);
+                            }
+
+                            if election::become_leader(
+                                Arc::clone(&el_state),
+                                Arc::clone(&el_log),
+                                Arc::clone(&el_transport),
+                                Arc::clone(&el_storage),
+                            ).await.is_ok() {
+                                // Fresh shutdown channel for this leader term.
+                                let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+                                shutdown_tx = Some(sd_tx);
+
+                                let notify = replication::start_replication_tasks(
+                                    Arc::clone(&el_state),
+                                    Arc::clone(&el_log),
+                                    Arc::clone(&el_transport),
+                                    Arc::clone(&el_storage),
+                                    ReplicationConfig::default(),
+                                    Arc::clone(&el_commit_notify),
+                                    sd_rx,
+                                ).await;
+                                entry_notify = Some(notify);
+                            }
+                        }
+                    }
+
+                    // ── Client propose request ────────────────────────────────
+                    // Append to log, persist, wake replication tasks, register
+                    // pending reply.  Does NOT block on commit — the apply arm
+                    // completes the oneshot once the entry is committed.
+                    Some((cmd, reply_tx)) = propose_rx.recv() => {
+                        let is_leader = el_state.lock().await.is_leader();
+                        if !is_leader {
+                            let _ = reply_tx.send(Err(anyhow::anyhow!("not the Raft leader")));
+                            continue;
+                        }
+
+                        // Append while holding both locks (consistent ordering).
+                        let (entry_index, all_entries) = {
+                            let state_guard = el_state.lock().await;
+                            let mut log_guard = el_log.lock().await;
+                            let term = state_guard.persistent.current_term;
+                            let idx = log_guard.append_command(term, cmd);
+                            let entries = log_guard.entries_from(1);
+                            (idx, entries)
+                            // locks released here
+                        };
+
+                        // Persist the updated log to disk (synchronous but fast).
+                        el_storage
+                            .save_log(&all_entries)
+                            .expect("failed to persist log on propose");
+
+                        pending.insert(entry_index, reply_tx);
+
+                        // Wake per-peer replication tasks.
+                        if let Some(ref n) = entry_notify {
+                            n.notify_waiters();
+                        }
+                    }
+
+                    // All channel senders dropped — time to exit.
+                    else => break,
+                }
+            }
+        });
 
         RaftNode {
             node_id,
             state: raft_state,
             log: raft_log,
-            transport,
             peer_id_map,
             propose_tx,
-            commit_callbacks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            commit_callbacks,
             storage,
+            apply_tx,
+            timer,
         }
     }
 
@@ -249,6 +425,11 @@ impl RaftNode {
                 .save_persistent_state(&state_guard.persistent)
                 .expect("failed to persist voted_for");
 
+            // 5. Reset election timer so we don't trigger a spurious election
+            //    immediately after granting a vote (Raft §5.2).
+            drop(state_guard);
+            self.timer.reset();
+
             return rpc::RequestVoteReply {
                 term: current_term,
                 vote_granted: true,
@@ -264,23 +445,18 @@ impl RaftNode {
     /// Handle an incoming `AppendEntries` RPC from the leader.
     ///
     /// Called by the CC HTTP server on `POST /raft/append_entries`.
-    /// Delegates to `replication::handle_append_entries`.
-    /// The caller must supply an `apply_tx` sender so committed entries reach
-    /// the state machine.  In the full event-loop design, this sender is
-    /// created once and stored alongside the `RaftNode`.
     pub async fn handle_append_entries(
         &self,
         args: rpc::AppendEntriesArgs<Command>,
-        apply_tx: tokio::sync::mpsc::Sender<ApplyMsg<Command>>,
-        reset_election_timer: impl Fn() + Send,
     ) -> rpc::AppendEntriesReply {
+        let timer = Arc::clone(&self.timer);
         replication::handle_append_entries(
             args,
             Arc::clone(&self.state),
             Arc::clone(&self.log),
             Arc::clone(&self.storage),
-            apply_tx,
-            reset_election_timer,
+            self.apply_tx.clone(),
+            move || timer.reset(),
         )
         .await
     }
