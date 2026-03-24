@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// Raft state machine commands — types of entries written to the Raft log
-// ---------------------------------------------------------------------------
+// region state machine commands
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum Command {
@@ -44,9 +42,9 @@ pub enum Command {
     DeregisterNode { node_id: String },
 }
 
-// ---------------------------------------------------------------------------
-// Task and node state — what the Raft state machine holds after applying logs
-// ---------------------------------------------------------------------------
+// endregion
+
+// region task and node state
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -70,11 +68,15 @@ pub struct NodeInfo {
     pub address: String,
     pub last_heartbeat: u64,
     pub agent_ids: Vec<String>,
+    /// Number of agent workers this LC is running (0 = standby replica).
+    pub agent_count: usize,
+    pub extractor_script: String,
+    pub image_base_path: String,
 }
 
-// ---------------------------------------------------------------------------
-// HTTP request/response types — used between components
-// ---------------------------------------------------------------------------
+// endregion
+
+// region HTTP request/response types
 
 /// Local controller -> Cluster controller: request a batch of work
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,6 +114,10 @@ pub struct HeartbeatRequest {
     pub address: String,
     pub agent_ids: Vec<String>,
     pub load: f64, // e.g. CPU usage or tasks in flight
+    /// Number of agent workers this LC is running (0 = standby replica).
+    pub agent_count: usize,
+    pub extractor_script: String,
+    pub image_base_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,6 +140,8 @@ pub struct ClusterStatus {
     pub assigned_tasks: u64,
     pub completed_tasks: u64,
     pub registered_nodes: Vec<NodeInfo>,
+    /// Node IDs of local controllers that have not sent a heartbeat recently.
+    pub stale_nodes: Vec<String>,
 }
 
 /// Agent -> Local controller: periodic heartbeat with current status
@@ -142,3 +150,22 @@ pub struct AgentHeartbeat {
     pub agent_id: String,
     pub current_batch_id: Option<u64>,
 }
+
+/// Cluster controller -> Replica LC: instruct it to activate and take over for a failed LC.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActivateRequest {
+    /// The node_id of the LC that has failed (informational).
+    pub failed_node_id: String,
+    /// Number of agent workers to spawn.
+    pub agent_count: usize,
+    pub extractor_script: String,
+    pub image_base_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActivateResponse {
+    pub activated: bool,
+    pub message: String,
+}
+
+// endregion

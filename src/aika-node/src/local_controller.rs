@@ -1,6 +1,10 @@
 use crate::common::*;
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 pub struct LocalControllerConfig {
     pub node_id: String,
@@ -8,11 +12,12 @@ pub struct LocalControllerConfig {
     pub cc_addrs: Vec<String>,
     pub agent_count: usize,
     pub health_check_interval: u64,
+    pub extractor_script: String,
+    pub image_base_path: String,
 }
 
 /// Tracks the state of a locally managed agent process.
 struct ManagedAgent {
-    agent_id: String,
     /// Handle to the spawned child process; used to check liveness and kill on shutdown.
     process: std::process::Child,
     /// Unix timestamp of the last heartbeat received from this agent.
@@ -21,58 +26,37 @@ struct ManagedAgent {
     current_batch_id: Option<u64>,
 }
 
-/// The local controller's runtime state.
+/// The local controller's runtime state — owned by a single Mutex.
 struct LocalControllerState {
     config: LocalControllerConfig,
     agents: HashMap<String, ManagedAgent>,
-    /// Cached address of the current Raft leader (updated on redirects)
+    /// Cached address of the current Raft leader (updated on redirects).
     current_leader: Option<String>,
+    /// True when this LC has agents running (startup with agent_count > 0, or after /activate).
+    is_active: bool,
 }
 
 impl LocalControllerState {
     fn new(config: LocalControllerConfig) -> Self {
-        todo!()
-    }
-
-    /// Resolve the current cluster controller leader address.
-    /// Tries cached leader first, then queries each CC address.
-    async fn find_leader(&mut self) -> anyhow::Result<String> {
-        // 1. If current_leader is Some, return it.
-        // 2. Otherwise, iterate cc_addrs and GET /leader on each.
-        // 3. Cache and return the leader address.
-        // 4. If no leader found, return error.
-        todo!()
-    }
-
-    /// Forward a task request to the cluster controller on behalf of an agent.
-    async fn request_task_for_agent(&mut self, agent_id: &str) -> anyhow::Result<TaskAssignment> {
-        // 1. Find leader address.
-        // 2. POST /task/request with TaskRequest { agent_id }.
-        // 3. If response is a redirect (NotLeader), update cached leader and retry.
-        // 4. Return the TaskAssignment.
-        todo!()
-    }
-
-    /// Forward a task completion to the cluster controller.
-    async fn complete_task(
-        &mut self,
-        completion: TaskCompletion,
-    ) -> anyhow::Result<TaskCompletionResponse> {
-        // 1. Find leader.
-        // 2. POST /task/complete with the completion payload.
-        // 3. Handle redirects.
-        // 4. Return response.
-        todo!()
-    }
-
-    /// Send a heartbeat to the cluster controller.
-    async fn send_heartbeat(&mut self) -> anyhow::Result<()> {
-        // 1. Build HeartbeatRequest with node_id, agent_ids, load info.
-        // 2. POST /heartbeat to the leader.
-        // 3. Handle errors gracefully (leader might be unavailable temporarily).
-        todo!()
+        let is_active = config.agent_count > 0;
+        Self {
+            config,
+            agents: HashMap::new(),
+            current_leader: None,
+            is_active,
+        }
     }
 }
+
+/// All shared handles needed by background tasks and HTTP handlers.
+/// `Clone` is cheap — Arc and reqwest::Client are both reference-counted.
+#[derive(Clone)]
+struct AppState {
+    state: Arc<Mutex<LocalControllerState>>,
+    client: reqwest::Client,
+}
+
+// region entry point
 
 /// Main entry point for the local controller.
 pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
@@ -85,26 +69,165 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
 
     let agent_count = config.agent_count;
     let health_interval = config.health_check_interval;
+    let bind = config.bind;
 
-    // TODO: Initialize LocalControllerState
-    // TODO: Spawn initial agent processes (if agent_count > 0)
-    // TODO: Start background loops:
-    //       - Agent health checker
-    //       - Heartbeat sender to cluster controller
-    // TODO: Start HTTP server for agent-facing endpoints
+    let state = Arc::new(Mutex::new(LocalControllerState::new(config)));
+    let client = reqwest::Client::new();
+    let app = AppState {
+        state: Arc::clone(&state),
+        client,
+    };
 
-    if agent_count == 0 {
+    // Spawn initial agent processes.
+    // No other tasks are running yet so holding the lock here is fine.
+    if agent_count > 0 {
+        // Extract config data without holding the lock during the spawn syscalls.
+        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path) = {
+            let g = state.lock().await;
+            (
+                g.config.node_id.clone(),
+                g.config.bind.port(),
+                g.config.cc_addrs.clone(),
+                g.config.extractor_script.clone(),
+                g.config.image_base_path.clone(),
+            )
+        };
+        let lc_addr = format!("127.0.0.1:{}", lc_port);
+
+        let mut spawned = Vec::with_capacity(agent_count);
+        for i in 0..agent_count {
+            let agent_id = format!("{}-agent-{}", node_id, i);
+            match spawn_agent(
+                &agent_id,
+                &lc_addr,
+                &cc_addrs,
+                &extractor_script,
+                &image_base_path,
+            ) {
+                Ok(agent) => {
+                    tracing::info!("Spawned agent {}", agent_id);
+                    spawned.push((agent_id, agent));
+                }
+                Err(e) => tracing::error!("Failed to spawn agent {}: {}", agent_id, e),
+            }
+        }
+
+        let mut g = state.lock().await;
+        for (id, agent) in spawned {
+            g.agents.insert(id, agent);
+        }
+    } else {
         tracing::info!("Running in replica mode (no agents) — standing by for failover");
     }
 
-    todo!()
+    // Start background tasks (both take a cheap clone of AppState).
+    let hb_app = app.clone();
+    tokio::spawn(async move { heartbeat_loop(hb_app).await });
+
+    let health_app = app.clone();
+    tokio::spawn(async move { agent_health_loop(health_app, health_interval).await });
+
+    // Start the HTTP server — this blocks until shutdown.
+    start_http_server(app, bind).await
 }
 
-// ---------------------------------------------------------------------------
-// Agent process lifecycle
-// ---------------------------------------------------------------------------
+// endregion
 
-/// Spawn a new agent as a child process on this node.
+// region CC leader discovery
+
+/// Return the cached leader address, or discover it by querying GET /leader
+/// on each known CC address.
+///
+/// Does NOT hold the mutex during the HTTP calls.
+async fn find_leader(app: &AppState) -> anyhow::Result<String> {
+    // Check the cache first.
+    {
+        let g = app.state.lock().await;
+        if let Some(addr) = &g.current_leader {
+            return Ok(addr.clone());
+        }
+    }
+
+    // Cache miss — query each CC.
+    let cc_addrs = {
+        let g = app.state.lock().await;
+        g.config.cc_addrs.clone()
+    };
+
+    for cc_addr in &cc_addrs {
+        let url = format!("http://{}/leader", cc_addr);
+        match app.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<LeaderResponse>().await {
+                    if let Some(addr) = body.leader_address {
+                        app.state.lock().await.current_leader = Some(addr.clone());
+                        return Ok(addr);
+                    }
+                }
+            }
+            Ok(resp) => tracing::debug!("CC {} /leader returned {}", cc_addr, resp.status()),
+            Err(e) => tracing::debug!("CC {} unreachable: {}", cc_addr, e),
+        }
+    }
+
+    anyhow::bail!("No Raft leader found among configured CCs")
+}
+
+/// Forward a POST request to the CC leader, updating the leader cache from the
+/// response URL (reqwest auto-follows 3xx redirects from non-leader CCs).
+///
+/// Retries once after clearing the cache if the first attempt fails.
+async fn proxy_to_leader<B, R>(app: &AppState, path: &str, body: &B) -> anyhow::Result<R>
+where
+    B: serde::Serialize,
+    R: for<'de> serde::Deserialize<'de>,
+{
+    for attempt in 0..2u32 {
+        let leader = find_leader(app).await?;
+        let url = format!("http://{}{}", leader, path);
+
+        match app.client.post(&url).json(body).send().await {
+            Ok(resp) => {
+                // Cache the actual endpoint reached (may differ from `leader` if
+                // reqwest followed a redirect to the true leader).
+                if let (Some(host), Some(port)) =
+                    (resp.url().host_str(), resp.url().port_or_known_default())
+                {
+                    let actual = format!("{}:{}", host, port);
+                    if actual != leader {
+                        tracing::debug!("Leader updated: {} -> {}", leader, actual);
+                        app.state.lock().await.current_leader = Some(actual);
+                    }
+                }
+
+                if resp.status().is_success() {
+                    return Ok(resp.json::<R>().await?);
+                }
+
+                tracing::warn!(
+                    "Proxy attempt {}/2 to {} returned {}",
+                    attempt + 1,
+                    path,
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Proxy attempt {}/2 to {} failed: {}", attempt + 1, path, e);
+            }
+        }
+
+        // Clear cache so the next attempt re-discovers the leader.
+        app.state.lock().await.current_leader = None;
+    }
+
+    anyhow::bail!("Failed to proxy {} to CC leader after 2 attempts", path)
+}
+
+// endregion
+
+// region agent process lifecycle
+
+/// Spawn a new agent as a child process using the same binary as the current process.
 fn spawn_agent(
     agent_id: &str,
     lc_addr: &str,
@@ -112,103 +235,298 @@ fn spawn_agent(
     extractor_script: &str,
     image_base_path: &str,
 ) -> anyhow::Result<ManagedAgent> {
-    // 1. Build the command:
-    //    inf3203_aika agent --agent-id <id> --lc-addr <addr> --cc-addrs <addrs>
-    // 2. Spawn as a child process.
-    // 3. Return ManagedAgent with the child handle.
-    //
-    // Use std::process::Command or tokio::process::Command
-    // Make sure to use the same binary path (std::env::current_exe())
-    todo!()
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("Cannot determine current executable: {}", e))?;
+
+    let child = std::process::Command::new(&exe)
+        .arg("agent")
+        .arg("--agent-id")
+        .arg(agent_id)
+        .arg("--lc-addr")
+        .arg(lc_addr)
+        .arg("--cc-addrs")
+        .arg(cc_addrs.join(","))
+        .arg("--extractor-script")
+        .arg(extractor_script)
+        .arg("--image-base-path")
+        .arg(image_base_path)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn agent process: {}", e))?;
+
+    Ok(ManagedAgent {
+        process: child,
+        last_heartbeat: unix_now(),
+        current_batch_id: None,
+    })
 }
 
-/// Check if an agent process is still alive and restart it if not.
-async fn check_and_recover_agent(
-    // state: &mut LocalControllerState,
-    agent_id: &str,
-) {
-    // 1. Check if the child process is still running (try_wait).
-    // 2. If it exited, log the crash.
-    // 3. Respawn the agent with the same agent_id.
-    // 4. The agent will request new work on startup — any in-flight task
-    //    will expire via TTL and be reassigned.
-    todo!()
-}
+// endregion
 
-// ---------------------------------------------------------------------------
-// Background loops
-// ---------------------------------------------------------------------------
+// region background loops
 
-/// Periodically checks that all managed agents are alive.
-async fn agent_health_loop(
-    // state: shared LocalControllerState,
-    interval_secs: u64,
-) {
-    // loop {
-    //     sleep(Duration::from_secs(interval_secs)).await;
-    //     for each agent in state.agents:
-    //         check_and_recover_agent(agent_id).await;
-    // }
-    todo!()
+/// Periodically checks that all managed agents are alive and restarts crashed ones.
+///
+/// Lock is held briefly per cycle (only for `try_wait` + possible respawn).
+async fn agent_health_loop(app: AppState, interval_secs: u64) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+
+        // Collect IDs of dead agents and config data needed for respawning —
+        // all under a single short-lived lock.
+        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path) = {
+            let mut g = app.state.lock().await;
+            let lc_port = g.config.bind.port();
+            let lc_addr = format!("127.0.0.1:{}", lc_port);
+            let cc_addrs = g.config.cc_addrs.clone();
+            let extractor_script = g.config.extractor_script.clone();
+            let image_base_path = g.config.image_base_path.clone();
+
+            let mut dead_ids = Vec::new();
+            for (id, agent) in g.agents.iter_mut() {
+                match agent.process.try_wait() {
+                    Ok(Some(status)) => {
+                        tracing::warn!("Agent {} exited ({}), will respawn", id, status);
+                        dead_ids.push(id.clone());
+                    }
+                    Ok(None) => {} // still running
+                    Err(e) => tracing::error!("try_wait failed for agent {}: {}", id, e),
+                }
+            }
+            // Remove dead entries so we can re-insert fresh ones below.
+            for id in &dead_ids {
+                g.agents.remove(id);
+            }
+
+            (
+                dead_ids,
+                lc_addr,
+                cc_addrs,
+                extractor_script,
+                image_base_path,
+            )
+        }; // Lock released before spawning.
+
+        // Spawn replacements outside the lock (process creation can be slow).
+        let mut respawned = Vec::new();
+        for agent_id in &dead_ids {
+            match spawn_agent(
+                agent_id,
+                &lc_addr,
+                &cc_addrs,
+                &extractor_script,
+                &image_base_path,
+            ) {
+                Ok(agent) => {
+                    tracing::info!("Respawned agent {}", agent_id);
+                    respawned.push((agent_id.clone(), agent));
+                }
+                Err(e) => tracing::error!("Failed to respawn agent {}: {}", agent_id, e),
+            }
+        }
+
+        if !respawned.is_empty() {
+            let mut g = app.state.lock().await;
+            for (id, agent) in respawned {
+                g.agents.insert(id, agent);
+            }
+        }
+    }
 }
 
 /// Periodically sends heartbeats to the cluster controller.
-async fn heartbeat_loop(// state: shared LocalControllerState,
-) {
-    // loop {
-    //     sleep(Duration::from_secs(10)).await;
-    //     state.send_heartbeat().await;
-    // }
-    todo!()
+/// Errors are logged and ignored — transient CC unavailability is expected.
+async fn heartbeat_loop(app: AppState) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Collect the data we need from state (brief lock, no I/O).
+        let (node_id, bind_addr, agent_ids, load, agent_count, extractor_script, image_base_path) = {
+            let g = app.state.lock().await;
+            let agent_ids: Vec<String> = g.agents.keys().cloned().collect();
+            let in_flight = g
+                .agents
+                .values()
+                .filter(|a| a.current_batch_id.is_some())
+                .count() as f64;
+            let load = if agent_ids.is_empty() {
+                0.0
+            } else {
+                in_flight / agent_ids.len() as f64
+            };
+            (
+                g.config.node_id.clone(),
+                g.config.bind.to_string(),
+                agent_ids,
+                load,
+                g.config.agent_count,
+                g.config.extractor_script.clone(),
+                g.config.image_base_path.clone(),
+            )
+        };
+
+        let req = HeartbeatRequest {
+            node_id,
+            address: bind_addr,
+            agent_ids,
+            load,
+            agent_count,
+            extractor_script,
+            image_base_path,
+        };
+
+        // find_leader + HTTP POST happen without holding the mutex.
+        match find_leader(&app).await {
+            Ok(leader) => {
+                let url = format!("http://{}/heartbeat", leader);
+                if let Err(e) = app.client.post(&url).json(&req).send().await {
+                    tracing::warn!("Heartbeat to CC failed: {}", e);
+                    // Clear stale leader cache so the next call re-discovers.
+                    app.state.lock().await.current_leader = None;
+                }
+            }
+            Err(e) => tracing::warn!("Heartbeat skipped — no leader found: {}", e),
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP server — endpoints for agents to communicate through
-// ---------------------------------------------------------------------------
+// endregion
 
-async fn start_http_server(
-    // state: shared LocalControllerState,
-    bind: SocketAddr,
-) -> anyhow::Result<()> {
-    // Routes:
-    //   POST /agent/heartbeat    -> handle_agent_heartbeat
-    //   POST /agent/request_task -> handle_agent_task_request
-    //   POST /agent/complete     -> handle_agent_task_complete
-    todo!()
+// region HTTP server
+
+async fn start_http_server(app: AppState, bind: SocketAddr) -> anyhow::Result<()> {
+    let router = Router::new()
+        .route("/agent/heartbeat", post(handle_agent_heartbeat))
+        .route("/agent/request_task", post(handle_agent_task_request))
+        .route("/agent/complete", post(handle_agent_task_complete))
+        .route("/activate", post(handle_activate))
+        .with_state(app);
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("Local controller HTTP server listening on {}", bind);
+    axum::serve(listener, router).await?;
+    Ok(())
 }
 
-/// POST /agent/heartbeat
+/// POST /activate — CC instructs this replica LC to spawn agents and take over for a failed node.
 ///
-/// Agents call this periodically to report they're alive.
+/// Idempotent: if already active, returns `activated: false` without spawning more agents.
+async fn handle_activate(
+    State(app): State<AppState>,
+    Json(req): Json<ActivateRequest>,
+) -> Json<ActivateResponse> {
+    let mut g = app.state.lock().await;
+
+    if g.is_active {
+        return Json(ActivateResponse {
+            activated: false,
+            message: "already active".into(),
+        });
+    }
+
+    tracing::info!(
+        "Activating as replacement for failed LC {} — spawning {} agents",
+        req.failed_node_id,
+        req.agent_count
+    );
+
+    // Mark active *before* releasing the lock to prevent a concurrent
+    // /activate request from passing the is_active check and double-spawning.
+    g.is_active = true;
+
+    // Update config so heartbeats and health checks reflect the new parameters.
+    g.config.agent_count = req.agent_count;
+    g.config.extractor_script = req.extractor_script.clone();
+    g.config.image_base_path = req.image_base_path.clone();
+
+    let lc_addr = format!("127.0.0.1:{}", g.config.bind.port());
+    let cc_addrs = g.config.cc_addrs.clone();
+    let node_id = g.config.node_id.clone();
+
+    // Spawn agents outside the lock (process creation can be slow).
+    drop(g);
+
+    let mut spawned = Vec::with_capacity(req.agent_count);
+    for i in 0..req.agent_count {
+        let agent_id = format!("{}-agent-{}", node_id, i);
+        match spawn_agent(
+            &agent_id,
+            &lc_addr,
+            &cc_addrs,
+            &req.extractor_script,
+            &req.image_base_path,
+        ) {
+            Ok(agent) => {
+                tracing::info!("Spawned agent {}", agent_id);
+                spawned.push((agent_id, agent));
+            }
+            Err(e) => tracing::error!("Failed to spawn agent {}: {}", agent_id, e),
+        }
+    }
+
+    let count = spawned.len();
+    let mut g = app.state.lock().await;
+    for (id, agent) in spawned {
+        g.agents.insert(id, agent);
+    }
+
+    Json(ActivateResponse {
+        activated: true,
+        message: format!("spawned {} agents", count),
+    })
+}
+
+/// POST /agent/heartbeat — agent reports it is alive.
 async fn handle_agent_heartbeat(
-    // state: extract shared state,
-    heartbeat: AgentHeartbeat,
-) {
-    // 1. Update the agent's last_heartbeat timestamp in state.
-    // 2. Update current_batch_id if provided.
-    todo!()
+    State(app): State<AppState>,
+    Json(heartbeat): Json<AgentHeartbeat>,
+) -> StatusCode {
+    let mut g = app.state.lock().await;
+    if let Some(agent) = g.agents.get_mut(&heartbeat.agent_id) {
+        agent.last_heartbeat = unix_now();
+        agent.current_batch_id = heartbeat.current_batch_id;
+    } else {
+        tracing::debug!("Heartbeat from unknown agent {}", heartbeat.agent_id);
+    }
+    StatusCode::OK
 }
 
-/// POST /agent/request_task
-///
-/// Agent asks for work. Local controller proxies to cluster controller.
+/// POST /agent/request_task — agent requests a work batch; proxied to CC leader.
 async fn handle_agent_task_request(
-    // state: extract shared state,
-    request: TaskRequest,
-) -> Result<TaskAssignment, ()> {
-    // 1. Proxy to state.request_task_for_agent(request.agent_id).
-    // 2. Return the assignment or an error.
-    todo!()
+    State(app): State<AppState>,
+    Json(request): Json<TaskRequest>,
+) -> Result<Json<TaskAssignment>, StatusCode> {
+    proxy_to_leader::<_, TaskAssignment>(&app, "/task/request", &request)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("Task request proxy failed: {}", e);
+            StatusCode::SERVICE_UNAVAILABLE
+        })
 }
 
-/// POST /agent/complete
-///
-/// Agent reports completion. Local controller proxies to cluster controller.
+/// POST /agent/complete — agent reports batch completion; proxied to CC leader.
 async fn handle_agent_task_complete(
-    // state: extract shared state,
-    completion: TaskCompletion,
-) -> Result<TaskCompletionResponse, ()> {
-    // 1. Proxy to state.complete_task(completion).
-    // 2. Return the response.
-    todo!()
+    State(app): State<AppState>,
+    Json(completion): Json<TaskCompletion>,
+) -> Result<Json<TaskCompletionResponse>, StatusCode> {
+    proxy_to_leader::<_, TaskCompletionResponse>(&app, "/task/complete", &completion)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("Task completion proxy failed: {}", e);
+            StatusCode::SERVICE_UNAVAILABLE
+        })
 }
+
+// endregion
+
+// region utilities
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// endregion

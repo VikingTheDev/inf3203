@@ -1,22 +1,45 @@
 use crate::common::*;
-use std::collections::HashMap;
+use crate::raft::{RaftNode, rpc};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
+
+// region config
 
 pub struct ClusterControllerConfig {
     pub node_id: u64,
     pub bind: SocketAddr,
     pub peers: Vec<String>,
     pub task_ttl_secs: u64,
+    /// Directory containing unlabeled images to ingest.
+    pub image_dir: String,
+    /// Number of images per task batch.
+    pub batch_size: usize,
+    /// Seconds without heartbeat before a local controller is considered failed.
+    pub lc_heartbeat_timeout_secs: u64,
+    /// Node-local directory for Raft persistent state (must NOT be on shared FS).
+    pub data_dir: String,
+    /// Directory for writing the results NDJSON file (can be on NFS).
+    pub results_dir: String,
 }
 
+// endregion
+
+// region state machine
+
 /// Holds the replicated state derived from applying Raft log entries.
-/// This is your Raft state machine.
 struct StateMachine {
-    /// All task batches keyed by batch_id.
     tasks: HashMap<u64, TaskBatch>,
-    /// Registered nodes (local controllers) keyed by node_id.
     nodes: HashMap<String, NodeInfo>,
-    /// Monotonically increasing counter for assigning new batch IDs.
     next_batch_id: u64,
 }
 
@@ -30,56 +53,157 @@ impl StateMachine {
     }
 
     /// Apply a committed Command to the state machine.
-    /// Called by the Raft layer after a log entry is committed.
     fn apply(&mut self, command: Command) {
         match command {
-            Command::NoOp => {} // leader no-op entry — nothing to apply
+            Command::NoOp => {}
 
             Command::AddTaskBatch {
                 batch_id,
                 image_paths,
             } => {
-                todo!("Insert new TaskBatch with status Pending")
+                self.tasks.entry(batch_id).or_insert_with(|| TaskBatch {
+                    batch_id,
+                    image_paths,
+                    status: TaskStatus::Pending,
+                    labels: HashMap::new(),
+                });
+                if batch_id >= self.next_batch_id {
+                    self.next_batch_id = batch_id + 1;
+                }
             }
+
             Command::AssignTask {
                 batch_id,
                 agent_id,
                 assigned_at,
             } => {
-                todo!("Change batch status from Pending to Assigned")
+                if let Some(batch) = self.tasks.get_mut(&batch_id) {
+                    if batch.status == TaskStatus::Pending {
+                        batch.status = TaskStatus::Assigned {
+                            agent_id,
+                            assigned_at,
+                        };
+                    }
+                    // Already Assigned or Completed — no-op (idempotent).
+                }
             }
+
             Command::CompleteTask { batch_id, labels } => {
-                todo!("Change batch status to Completed, store labels")
+                if let Some(batch) = self.tasks.get_mut(&batch_id) {
+                    if batch.status != TaskStatus::Completed {
+                        batch.labels = labels.into_iter().collect();
+                        batch.status = TaskStatus::Completed;
+                    }
+                    // Already Completed — no-op (idempotent).
+                }
             }
+
             Command::ExpireTask { batch_id } => {
-                todo!("If batch is Assigned, reset to Pending")
+                if let Some(batch) = self.tasks.get_mut(&batch_id) {
+                    if matches!(batch.status, TaskStatus::Assigned { .. }) {
+                        batch.status = TaskStatus::Pending;
+                    }
+                }
             }
+
             Command::RegisterNode { node_id, address } => {
-                todo!("Add or update node in registry")
+                self.nodes
+                    .entry(node_id.clone())
+                    .and_modify(|n| n.address = address.clone())
+                    .or_insert_with(|| NodeInfo {
+                        node_id,
+                        address,
+                        last_heartbeat: unix_now(),
+                        agent_ids: Vec::new(),
+                        agent_count: 0,
+                        extractor_script: String::new(),
+                        image_base_path: String::new(),
+                    });
             }
+
             Command::DeregisterNode { node_id } => {
-                todo!("Remove node from registry")
+                self.nodes.remove(&node_id);
             }
         }
     }
 
-    /// Find the next pending batch and return it, or None if all work is done.
+    /// Return the first batch with status `Pending`, if any.
     fn next_pending_batch(&self) -> Option<&TaskBatch> {
-        todo!("Return first batch with status == Pending")
+        self.tasks
+            .values()
+            .find(|b| b.status == TaskStatus::Pending)
     }
 
-    /// Collect all batches whose TTL has expired.
+    /// Collect the `batch_id`s of all batches whose assignment TTL has expired.
     fn expired_batches(&self, now: u64, ttl_secs: u64) -> Vec<u64> {
-        todo!("Return batch_ids where status is Assigned and now - assigned_at > ttl_secs")
+        self.tasks
+            .values()
+            .filter_map(|b| {
+                if let TaskStatus::Assigned { assigned_at, .. } = b.status {
+                    if now.saturating_sub(assigned_at) > ttl_secs {
+                        return Some(b.batch_id);
+                    }
+                }
+                None
+            })
+            .collect()
     }
 
-    /// Build a ClusterStatus summary.
-    fn status(&self) -> ClusterStatus {
-        todo!()
+    /// Build a ClusterStatus snapshot.
+    ///
+    /// `now` and `lc_timeout_secs` are used to identify stale local controllers
+    /// (those that have not sent a heartbeat recently).
+    fn status(&self, now: u64, lc_timeout_secs: u64) -> ClusterStatus {
+        let mut pending = 0u64;
+        let mut assigned = 0u64;
+        let mut completed = 0u64;
+
+        for b in self.tasks.values() {
+            match b.status {
+                TaskStatus::Pending => pending += 1,
+                TaskStatus::Assigned { .. } => assigned += 1,
+                TaskStatus::Completed => completed += 1,
+            }
+        }
+
+        let stale_nodes = self
+            .nodes
+            .values()
+            .filter(|n| now.saturating_sub(n.last_heartbeat) > lc_timeout_secs)
+            .map(|n| n.node_id.clone())
+            .collect();
+
+        ClusterStatus {
+            total_tasks: self.tasks.len() as u64,
+            pending_tasks: pending,
+            assigned_tasks: assigned,
+            completed_tasks: completed,
+            registered_nodes: self.nodes.values().cloned().collect(),
+            stale_nodes,
+        }
     }
 }
 
-/// Main entry point for the cluster controller.
+// endregion
+
+// region shared app state
+
+#[derive(Clone)]
+struct AppState {
+    raft: RaftNode,
+    sm: Arc<Mutex<StateMachine>>,
+    /// Timeout used for LC liveness checks and the `/status` stale-node list.
+    lc_timeout_secs: u64,
+    /// This node's numeric ID, used to name the results output file.
+    node_id: u64,
+    /// Directory for writing the results NDJSON file.
+    results_dir: String,
+}
+
+// endregion
+
+// region main entrypoint
+
 pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
     tracing::info!(
         "Starting cluster controller {} on {}",
@@ -87,144 +211,589 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
         config.bind
     );
 
-    // TODO: Initialize your Raft node with config.node_id and config.peers
-    // TODO: Initialize the StateMachine
-    // TODO: Start the TTL reaper background task
-    // TODO: Start the HTTP server with the routes below
-    // TODO: If elected leader, ingest tasks from the image directory
+    let bind = config.bind;
+    let task_ttl_secs = config.task_ttl_secs;
+    let image_dir = config.image_dir.clone();
+    let batch_size = config.batch_size;
+    let lc_timeout_secs = config.lc_heartbeat_timeout_secs;
+    let node_id = config.node_id;
+    let results_dir = config.results_dir.clone();
 
-    start_http_server(config).await
+    // Ensure the results directory exists (may be on NFS).
+    std::fs::create_dir_all(&config.results_dir)?;
+
+    // Node-local Raft storage (must NOT be a shared/distributed filesystem).
+    let data_dir = std::path::PathBuf::from(&config.data_dir).join("raft");
+    let raft = RaftNode::new(config.node_id, config.peers, data_dir);
+    let sm: Arc<Mutex<StateMachine>> = Arc::new(Mutex::new(StateMachine::new()));
+
+    // Register the state machine's apply function as a Raft commit callback.
+    // This runs synchronously from inside the event loop — no await, no deadlock.
+    {
+        let sm_cb = Arc::clone(&sm);
+        raft.on_commit(move |cmd| {
+            sm_cb.lock().expect("sm lock poisoned").apply(cmd);
+        });
+    }
+
+    let app = AppState {
+        raft: raft.clone(),
+        sm: Arc::clone(&sm),
+        lc_timeout_secs,
+        node_id,
+        results_dir,
+    };
+
+    // TTL reaper — only the leader acts, followers idle.
+    {
+        let reaper_app = app.clone();
+        tokio::spawn(async move {
+            ttl_reaper_loop(reaper_app, task_ttl_secs).await;
+        });
+    }
+
+    // Leadership watcher — resumes/completes image ingestion on every election win.
+    // Ingestion may have been partial if the previous leader crashed mid-way;
+    // `ingest_image_tasks` uses `next_batch_id` to skip already-committed batches.
+    {
+        let ingest_app = app.clone();
+        tokio::spawn(async move {
+            let mut was_leader = false;
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let is_leader = ingest_app.raft.is_leader();
+                if is_leader && !was_leader {
+                    ingest_image_tasks(&ingest_app, &image_dir, batch_size).await;
+                }
+                was_leader = is_leader;
+            }
+        });
+    }
+
+    // LC liveness monitor — logs warnings when a local controller goes silent.
+    {
+        let monitor_app = app.clone();
+        tokio::spawn(async move { lc_monitor_loop(monitor_app).await });
+    }
+
+    // Results persistence — periodically flushes completed labels to disk.
+    {
+        let flush_app = app.clone();
+        tokio::spawn(async move { results_flush_loop(flush_app).await });
+    }
+
+    start_http_server(app, bind).await
 }
 
-// ---------------------------------------------------------------------------
-// HTTP server and route handlers
-// ---------------------------------------------------------------------------
+// endregion
 
-async fn start_http_server(config: ClusterControllerConfig) -> anyhow::Result<()> {
-    // TODO: Set up axum/actix/warp router with the routes below, bind to config.bind
-    // Routes:
-    //   POST /task/request   -> handle_task_request
-    //   POST /task/complete   -> handle_task_complete
-    //   POST /heartbeat       -> handle_heartbeat
-    //   GET  /leader          -> handle_leader_query
-    //   GET  /status          -> handle_status
-    //
-    // The router needs shared access to the Raft node and StateMachine,
-    // typically via Arc<Mutex<...>> or Arc<RwLock<...>>
+// region http server
 
-    todo!()
+async fn start_http_server(app: AppState, bind: SocketAddr) -> anyhow::Result<()> {
+    let router = Router::new()
+        // Task endpoints (agent/LC-facing)
+        .route("/task/request", post(handle_task_request))
+        .route("/task/complete", post(handle_task_complete))
+        .route("/heartbeat", post(handle_heartbeat))
+        .route("/leader", get(handle_leader_query))
+        .route("/status", get(handle_status))
+        // Raft internal endpoints (CC-to-CC only)
+        .route("/raft/request_vote", post(handle_raft_request_vote))
+        .route("/raft/append_entries", post(handle_raft_append_entries))
+        .with_state(app);
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("Cluster controller HTTP server listening on {}", bind);
+    axum::serve(listener, router).await?;
+    Ok(())
 }
 
-/// POST /task/request
+// endregion
+
+// region task handlers
+
+/// POST /task/request — assign the next pending batch to the requesting agent.
 ///
-/// Called by agents (via local controller) to get a batch of work.
-/// Only the Raft leader can assign tasks. If this node is not the leader,
-/// return a redirect to the leader's address.
+/// Only the leader can assign tasks. Non-leaders redirect to the leader.
+/// Retries up to 5 times to handle simultaneous-assignment collisions.
 async fn handle_task_request(
-    // state: extract shared Raft + StateMachine
-    request: TaskRequest,
-) -> Result<TaskAssignment, ApiError> {
-    // 1. Check if we are the Raft leader. If not, return leader redirect.
-    // 2. Find next pending batch from StateMachine.
-    // 3. Propose an AssignTask command through Raft.
-    // 4. Wait for commit.
-    // 5. Return the TaskAssignment with batch_id and image_paths.
-    todo!()
+    State(app): State<AppState>,
+    Json(request): Json<TaskRequest>,
+) -> Result<Json<TaskAssignment>, ApiError> {
+    redirect_if_not_leader(&app)?;
+
+    for _ in 0..5u32 {
+        // Find a pending batch (brief lock, no I/O).
+        let batch = {
+            let sm = app.sm.lock().expect("sm lock");
+            sm.next_pending_batch().cloned()
+        };
+        let Some(batch) = batch else {
+            return Err(ApiError::NoWorkAvailable);
+        };
+
+        // Propose the assignment through Raft (blocks until committed).
+        app.raft
+            .propose(Command::AssignTask {
+                batch_id: batch.batch_id,
+                agent_id: request.agent_id.clone(),
+                assigned_at: unix_now(),
+            })
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        // Verify we actually got the batch (another agent may have raced us).
+        let got_it = {
+            let sm = app.sm.lock().expect("sm lock");
+            sm.tasks.get(&batch.batch_id).is_some_and(|b| {
+                matches!(&b.status, TaskStatus::Assigned { agent_id, .. } if agent_id == &request.agent_id)
+            })
+        };
+        if got_it {
+            return Ok(Json(TaskAssignment {
+                batch_id: batch.batch_id,
+                image_paths: batch.image_paths,
+            }));
+        }
+        // Collision — try the next pending batch.
+    }
+
+    Err(ApiError::NoWorkAvailable)
 }
 
-/// POST /task/complete
-///
-/// Called by agents to report completed work. Idempotent — completing an
-/// already-completed batch is a no-op success.
+/// POST /task/complete — record the labels for a completed batch. Idempotent.
 async fn handle_task_complete(
-    // state: extract shared Raft + StateMachine
-    request: TaskCompletion,
-) -> Result<TaskCompletionResponse, ApiError> {
-    // 1. Check if we are the Raft leader. If not, redirect.
-    // 2. Check batch status:
-    //    - Already Completed -> return accepted (idempotent)
-    //    - Assigned to this agent -> propose CompleteTask via Raft
-    //    - Pending (TTL expired and reassigned) -> still accept if valid
-    // 3. Wait for commit.
-    // 4. Return response.
-    todo!()
+    State(app): State<AppState>,
+    Json(completion): Json<TaskCompletion>,
+) -> Result<Json<TaskCompletionResponse>, ApiError> {
+    redirect_if_not_leader(&app)?;
+
+    // Already completed → accept without a Raft round-trip.
+    let already_done = {
+        let sm = app.sm.lock().expect("sm lock");
+        sm.tasks
+            .get(&completion.batch_id)
+            .is_some_and(|b| b.status == TaskStatus::Completed)
+    };
+    if already_done {
+        return Ok(Json(TaskCompletionResponse {
+            accepted: true,
+            message: "already completed (idempotent)".into(),
+        }));
+    }
+
+    app.raft
+        .propose(Command::CompleteTask {
+            batch_id: completion.batch_id,
+            labels: completion.labels,
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(TaskCompletionResponse {
+        accepted: true,
+        message: "accepted".into(),
+    }))
 }
 
-/// POST /heartbeat
+/// POST /heartbeat — record liveness of a local controller.
 ///
-/// Called periodically by local controllers to report liveness.
+/// Heartbeat state is ephemeral (not replicated) — it is rebuilt from
+/// incoming heartbeats after every leader election.
 async fn handle_heartbeat(
-    // state: extract shared Raft + StateMachine
-    request: HeartbeatRequest,
-) -> Result<HeartbeatResponse, ApiError> {
-    // 1. Update last_heartbeat and agent list for this node in state.
-    //    (This can be done locally without Raft if you treat heartbeats
-    //     as ephemeral state, or propose a RegisterNode command if you
-    //     want it replicated.)
-    // 2. Return acknowledgment.
-    todo!()
+    State(app): State<AppState>,
+    Json(request): Json<HeartbeatRequest>,
+) -> Result<Json<HeartbeatResponse>, ApiError> {
+    redirect_if_not_leader(&app)?;
+
+    {
+        let mut sm = app.sm.lock().expect("sm lock");
+        let entry = sm
+            .nodes
+            .entry(request.node_id.clone())
+            .or_insert_with(|| NodeInfo {
+                node_id: request.node_id.clone(),
+                address: request.address.clone(),
+                last_heartbeat: unix_now(),
+                agent_ids: Vec::new(),
+                agent_count: 0,
+                extractor_script: String::new(),
+                image_base_path: String::new(),
+            });
+        entry.last_heartbeat = unix_now();
+        entry.agent_ids = request.agent_ids;
+        entry.address = request.address;
+        entry.agent_count = request.agent_count;
+        entry.extractor_script = request.extractor_script;
+        entry.image_base_path = request.image_base_path;
+    }
+
+    Ok(Json(HeartbeatResponse { acknowledged: true }))
 }
 
-/// GET /leader
+/// GET /leader — return the current Raft leader's address.
+async fn handle_leader_query(State(app): State<AppState>) -> Json<LeaderResponse> {
+    let (leader_id, leader_address) = match app.raft.leader_info() {
+        Some((id, addr)) => (Some(id), Some(addr)),
+        None => (None, None),
+    };
+    Json(LeaderResponse {
+        leader_id,
+        leader_address,
+    })
+}
+
+/// GET /status — return a summary of task progress and node health.
+async fn handle_status(State(app): State<AppState>) -> Json<ClusterStatus> {
+    let now = unix_now();
+    let status = app
+        .sm
+        .lock()
+        .expect("sm lock")
+        .status(now, app.lc_timeout_secs);
+    Json(status)
+}
+
+// endregion
+
+// region raft internal handlers (CC only)
+
+/// POST /raft/request_vote
+async fn handle_raft_request_vote(
+    State(app): State<AppState>,
+    Json(args): Json<rpc::RequestVoteArgs>,
+) -> Json<rpc::RequestVoteReply> {
+    Json(app.raft.handle_request_vote(args).await)
+}
+
+/// POST /raft/append_entries
+async fn handle_raft_append_entries(
+    State(app): State<AppState>,
+    Json(args): Json<rpc::AppendEntriesArgs<Command>>,
+) -> Json<rpc::AppendEntriesReply> {
+    let reply = app.raft.handle_append_entries(args).await;
+    Json(reply)
+}
+
+// endregion
+
+// region background tasks
+
+/// Periodically scans for expired task assignments and proposes `ExpireTask`
+/// to return them to Pending so they can be reassigned.
 ///
-/// Returns the current Raft leader's address so clients can find it.
-async fn handle_leader_query(// state: extract shared Raft
-) -> LeaderResponse {
-    // 1. Ask Raft layer who the current leader is.
-    // 2. Return leader_id and leader_address.
-    todo!()
+/// Only the leader acts; followers sleep and check again next cycle.
+async fn ttl_reaper_loop(app: AppState, ttl_secs: u64) {
+    let interval = Duration::from_secs((ttl_secs / 2).max(5));
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if !app.raft.is_leader() {
+            continue;
+        }
+
+        let now = unix_now();
+        // Brief lock to collect expired IDs — no I/O while holding it.
+        let expired = {
+            app.sm
+                .lock()
+                .expect("sm lock")
+                .expired_batches(now, ttl_secs)
+        };
+
+        for batch_id in expired {
+            tracing::info!("TTL expired for batch {}, returning to Pending", batch_id);
+            if let Err(e) = app.raft.propose(Command::ExpireTask { batch_id }).await {
+                tracing::warn!("Failed to propose ExpireTask for batch {}: {}", batch_id, e);
+            }
+        }
+    }
 }
 
-/// GET /status
+/// Read image filenames from `image_dir`, chunk them into batches, and
+/// propose `AddTaskBatch` commands so every CC replica learns about them.
 ///
-/// Returns a summary of task progress and node health.
-async fn handle_status(// state: extract shared StateMachine
-) -> ClusterStatus {
-    // 1. Call state_machine.status()
-    todo!()
+/// Resumable: reads `next_batch_id` from the state machine and skips the
+/// corresponding prefix of the sorted image list, so a new leader after a
+/// mid-ingestion crash picks up exactly where the previous leader left off.
+async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) {
+    tracing::info!(
+        "Ingesting image tasks from {} (batch_size={})",
+        image_dir,
+        batch_size
+    );
+
+    // Collect image file names.
+    let mut names: Vec<String> = match tokio::fs::read_dir(image_dir).await {
+        Ok(mut dir) => {
+            let mut v = Vec::new();
+            loop {
+                match dir.next_entry().await {
+                    Ok(Some(entry)) => match entry.file_type().await {
+                        Ok(ft) if ft.is_file() => {
+                            v.push(entry.file_name().to_string_lossy().into_owned());
+                        }
+                        _ => {}
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!("Error reading image dir: {}", e);
+                        break;
+                    }
+                }
+            }
+            v
+        }
+        Err(e) => {
+            tracing::error!("Cannot open image dir {}: {}", image_dir, e);
+            return;
+        }
+    };
+
+    if names.is_empty() {
+        tracing::warn!("No image files found in {}", image_dir);
+        return;
+    }
+
+    names.sort_unstable();
+    let total_batches = names.len().div_ceil(batch_size) as u64;
+
+    // How many batches have already been committed by a previous leader.
+    let mut next_id = app.sm.lock().expect("sm lock").next_batch_id;
+
+    if next_id >= total_batches {
+        tracing::info!(
+            "All {} batches already ingested — nothing to do",
+            total_batches
+        );
+        return;
+    }
+
+    tracing::info!(
+        "Found {} images ({} batches total), resuming from batch {}",
+        names.len(),
+        total_batches,
+        next_id,
+    );
+
+    // Skip the image chunks already covered by committed batches.
+    for chunk in names.chunks(batch_size).skip(next_id as usize) {
+        if let Err(e) = app
+            .raft
+            .propose(Command::AddTaskBatch {
+                batch_id: next_id,
+                image_paths: chunk.to_vec(),
+            })
+            .await
+        {
+            tracing::error!("Failed to propose AddTaskBatch {}: {}", next_id, e);
+            // Non-fatal — TTL reaper or retry can handle partial ingestion.
+            break;
+        }
+        next_id += 1;
+    }
+
+    tracing::info!("Ingestion complete: {} batches proposed", next_id);
 }
 
-// ---------------------------------------------------------------------------
-// Background tasks
-// ---------------------------------------------------------------------------
+/// Monitor local controller liveness with two-stage failover.
+///
+/// Stage 1 (first `lc_timeout_secs` of silence): mark LC as "suspected", log warning.
+/// Stage 2 (another `lc_timeout_secs` of silence): LC is confirmed failed — find a
+/// standby replica (agent_count == 0) and send it POST /activate to take over.
+///
+/// State is cleared when this node loses leadership so the next leader starts fresh.
+async fn lc_monitor_loop(app: AppState) {
+    let interval = Duration::from_secs(10);
+    let client = reqwest::Client::new();
+    // node_id -> unix timestamp when it first exceeded the timeout (stage 1)
+    let mut suspected_since: HashMap<String, u64> = HashMap::new();
+    // node_ids that have already been delegated to a replica (avoid re-triggering)
+    let mut already_delegated: HashSet<String> = HashSet::new();
 
-/// Periodically scans for assigned tasks whose TTL has expired and
-/// proposes ExpireTask commands to return them to Pending.
-async fn ttl_reaper_loop(
-    // raft: shared Raft handle,
-    // state_machine: shared StateMachine,
-    ttl_secs: u64,
-) {
-    // loop {
-    //     sleep(Duration::from_secs(ttl_secs / 2)).await;
-    //     if !raft.is_leader() { continue; }
-    //     let now = current_unix_timestamp();
-    //     let expired = state_machine.expired_batches(now, ttl_secs);
-    //     for batch_id in expired {
-    //         raft.propose(Command::ExpireTask { batch_id }).await;
-    //     }
-    // }
-    todo!()
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if !app.raft.is_leader() {
+            suspected_since.clear();
+            already_delegated.clear();
+            continue;
+        }
+
+        let now = unix_now();
+        let timeout = app.lc_timeout_secs;
+        let nodes: Vec<NodeInfo> = app
+            .sm
+            .lock()
+            .expect("sm lock")
+            .nodes
+            .values()
+            .cloned()
+            .collect();
+
+        for node in &nodes {
+            let age = now.saturating_sub(node.last_heartbeat);
+
+            if age < timeout {
+                // Node is healthy — clear suspicion so it can be detected again later.
+                suspected_since.remove(&node.node_id);
+                already_delegated.remove(&node.node_id);
+                continue;
+            }
+
+            if !suspected_since.contains_key(&node.node_id) {
+                // Stage 1: first time we notice the timeout exceeded.
+                suspected_since.insert(node.node_id.clone(), now);
+                tracing::warn!(
+                    "LC {} suspected failed ({}s without heartbeat) — waiting before delegating",
+                    node.node_id,
+                    age
+                );
+                continue;
+            }
+
+            // Stage 2: node has been suspected for at least another full timeout.
+            let suspected_age = now.saturating_sub(suspected_since[&node.node_id]);
+            if suspected_age < timeout || already_delegated.contains(&node.node_id) {
+                continue;
+            }
+
+            tracing::warn!(
+                "LC {} confirmed failed ({}s total silence) — activating replica",
+                node.node_id,
+                age
+            );
+            already_delegated.insert(node.node_id.clone());
+
+            // Find a healthy standby replica (agent_count == 0, not itself, not failed).
+            let replica = nodes.iter().find(|n| {
+                n.node_id != node.node_id
+                    && n.agent_count == 0
+                    && now.saturating_sub(n.last_heartbeat) < timeout
+                    && !already_delegated.contains(&n.node_id)
+            });
+
+            if let Some(replica) = replica {
+                let req = ActivateRequest {
+                    failed_node_id: node.node_id.clone(),
+                    agent_count: node.agent_count.max(1),
+                    extractor_script: node.extractor_script.clone(),
+                    image_base_path: node.image_base_path.clone(),
+                };
+                let url = format!("http://{}/activate", replica.address);
+                match client.post(&url).json(&req).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!(
+                            "Replica {} activated to replace failed LC {}",
+                            replica.node_id,
+                            node.node_id
+                        );
+                    }
+                    Ok(resp) => tracing::warn!(
+                        "Replica {} activation returned unexpected status {}",
+                        replica.node_id,
+                        resp.status()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Failed to activate replica {} for LC {}: {}",
+                        replica.node_id,
+                        node.node_id,
+                        e
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    "No healthy standby replica found to replace failed LC {}",
+                    node.node_id
+                );
+            }
+        }
+    }
 }
 
-/// Scans the image directory and ingests tasks in batches.
-/// Only runs on the leader, and only once (or checks for already-ingested).
-async fn ingest_image_tasks(
-    // raft: shared Raft handle,
-    image_dir: &str,
-    batch_size: usize,
-) {
-    // 1. Read all filenames from image_dir
-    // 2. Chunk into batches of batch_size
-    // 3. For each chunk, propose AddTaskBatch command via Raft
-    // 4. Track progress so we don't re-ingest on leader re-election
-    //    (check state machine for existing batches)
-    todo!()
+/// Periodically flush completed task labels to a node-local NDJSON file.
+///
+/// Each line is a JSON object: `{"batch_id": N, "labels": [[path, label], ...]}`.
+/// Only newly completed batches since the last flush are appended, so the file
+/// grows incrementally and a crash only loses the current flush interval's data.
+///
+/// Runs only on the leader (the node with the authoritative state machine).
+/// File path: `<results_dir>/results_<node_id>.ndjson`
+async fn results_flush_loop(app: AppState) {
+    let path = format!("{}/results_{}.ndjson", app.results_dir, app.node_id);
+    let mut flushed: HashSet<u64> = HashSet::new();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        if !app.raft.is_leader() {
+            continue;
+        }
+
+        // Collect newly completed batches — brief lock, no I/O.
+        let new_completed: Vec<(u64, Vec<(String, String)>)> = {
+            let sm = app.sm.lock().expect("sm lock");
+            sm.tasks
+                .values()
+                .filter(|b| b.status == TaskStatus::Completed && !flushed.contains(&b.batch_id))
+                .map(|b| {
+                    let labels: Vec<(String, String)> = b
+                        .labels
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    (b.batch_id, labels)
+                })
+                .collect()
+        };
+
+        if new_completed.is_empty() {
+            continue;
+        }
+
+        // Append new records to the output file (no locks held).
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut file) => {
+                let mut written = 0usize;
+                for (batch_id, labels) in &new_completed {
+                    let record = serde_json::json!({
+                        "batch_id": batch_id,
+                        "labels": labels,
+                    });
+                    let line = format!("{}\n", record);
+                    match file.write_all(line.as_bytes()).await {
+                        Ok(()) => {
+                            flushed.insert(*batch_id);
+                            written += 1;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to write results to {}: {}", path, e);
+                            break;
+                        }
+                    }
+                }
+                if written > 0 {
+                    tracing::info!(
+                        "Flushed {} completed batches to {} ({} total flushed)",
+                        written,
+                        path,
+                        flushed.len()
+                    );
+                }
+            }
+            Err(e) => tracing::error!("Cannot open results file {}: {}", path, e),
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Error type for HTTP handlers
-// ---------------------------------------------------------------------------
+// endregion
+
+// region error types
 
 #[derive(Debug)]
 enum ApiError {
@@ -233,4 +802,51 @@ enum ApiError {
     Internal(String),
 }
 
-// TODO: Implement Into<HttpResponse> or axum's IntoResponse for ApiError
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self {
+            ApiError::NotLeader {
+                leader_address: Some(addr),
+            } => (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, format!("http://{}", addr))],
+                "not the leader",
+            )
+                .into_response(),
+            ApiError::NotLeader {
+                leader_address: None,
+            } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "leader unknown — election in progress",
+            )
+                .into_response(),
+            ApiError::NoWorkAvailable => {
+                (StatusCode::NO_CONTENT, "no work available").into_response()
+            }
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        }
+    }
+}
+
+// endregion
+
+// region Helpers
+
+/// If this node is not the Raft leader, return an `ApiError::NotLeader`
+/// redirect so the client can find and contact the leader directly.
+fn redirect_if_not_leader(app: &AppState) -> Result<(), ApiError> {
+    if app.raft.is_leader() {
+        return Ok(());
+    }
+    let leader_address = app.raft.leader_info().map(|(_, addr)| addr);
+    Err(ApiError::NotLeader { leader_address })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// endregion

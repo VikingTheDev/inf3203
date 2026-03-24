@@ -34,6 +34,28 @@ enum Role {
         /// TTL in seconds for assigned tasks before they are reclaimed
         #[arg(long, default_value = "120")]
         task_ttl_secs: u64,
+
+        /// Directory containing unlabeled images to ingest on first leader election
+        #[arg(long, default_value = "/share/inf3203/unlabeled_images")]
+        image_dir: String,
+
+        /// Number of images per task batch
+        #[arg(long, default_value = "100")]
+        batch_size: usize,
+
+        /// Seconds without heartbeat before a local controller is flagged as failed
+        #[arg(long, default_value = "60")]
+        lc_heartbeat_timeout_secs: u64,
+
+        /// Node-local directory for Raft persistent state (must NOT be on shared FS).
+        /// Defaults to /tmp/inf3203_<USER>_<node_id>
+        #[arg(long)]
+        data_dir: Option<String>,
+
+        /// Directory for writing the results NDJSON file (can be on NFS).
+        /// Defaults to $HOME/inf3203_data
+        #[arg(long)]
+        results_dir: Option<String>,
     },
 
     /// Run as a local controller (monitors agents on this physical node)
@@ -57,6 +79,14 @@ enum Role {
         /// Seconds between health checks on local agents
         #[arg(long, default_value = "5")]
         health_check_interval: u64,
+
+        /// Path to the feature extraction Python script (passed to spawned agents)
+        #[arg(long, default_value = "./feature_extractor.py")]
+        extractor_script: String,
+
+        /// Base path where the unlabeled images reside (passed to spawned agents)
+        #[arg(long, default_value = "/share/inf3203/unlabeled_images")]
+        image_base_path: String,
     },
 
     /// Run as a worker agent (usually spawned by a local controller)
@@ -98,12 +128,30 @@ async fn main() -> anyhow::Result<()> {
             bind,
             peers,
             task_ttl_secs,
+            image_dir,
+            batch_size,
+            lc_heartbeat_timeout_secs,
+            data_dir,
+            results_dir,
         } => {
+            let username = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+            let data_dir =
+                data_dir.unwrap_or_else(|| format!("/tmp/inf3203_{}_{}", username, node_id));
+            let results_dir = results_dir.unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| format!("{}/inf3203_data", h))
+                    .unwrap_or_else(|_| "/tmp/inf3203_data".into())
+            });
             let config = cluster_controller::ClusterControllerConfig {
                 node_id,
                 bind,
                 peers,
                 task_ttl_secs,
+                image_dir,
+                batch_size,
+                lc_heartbeat_timeout_secs,
+                data_dir,
+                results_dir,
             };
             cluster_controller::run(config).await
         }
@@ -114,6 +162,8 @@ async fn main() -> anyhow::Result<()> {
             cc_addrs,
             agents,
             health_check_interval,
+            extractor_script,
+            image_base_path,
         } => {
             let config = local_controller::LocalControllerConfig {
                 node_id,
@@ -121,6 +171,8 @@ async fn main() -> anyhow::Result<()> {
                 cc_addrs,
                 agent_count: agents,
                 health_check_interval,
+                extractor_script,
+                image_base_path,
             };
             local_controller::run(config).await
         }
