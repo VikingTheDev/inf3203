@@ -368,7 +368,7 @@ fn main() {
         let log_file = format!("{}/cc-{}.log", log_dir_str, node_id);
         // Wipe old Raft state on the target node (start fresh every time we deploy new cluster)
         let cmd = format!(
-            "rm -rf {} && nohup {} {} </dev/null >>{} 2>&1 &",
+            "rm -rf {} ; nohup {} {} </dev/null >>{} 2>&1 &",
             data_dir, binary_str, node_args, log_file
         );
         print!("  CC{} @ {}:{}  … ", node_id, node, port);
