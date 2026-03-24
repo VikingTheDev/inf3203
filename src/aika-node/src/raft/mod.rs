@@ -66,6 +66,11 @@ pub struct RaftNode {
     /// slice passed to `new`.  The local node always uses its own `node_id`.
     peer_id_map: HashMap<NodeId, u64>,
 
+    /// Maps every Raft NodeId (numeric string like "1", "2", …) to its
+    /// externally-reachable network address (like "c9-5:60875").
+    /// Built from the peers list which is ordered by node_id.
+    node_id_to_address: HashMap<NodeId, String>,
+
     /// Submits propose requests to the main Raft event loop.
     ///
     /// Each message carries the command and a one-shot reply channel that is
@@ -108,6 +113,14 @@ impl RaftNode {
             .iter()
             .enumerate()
             .map(|(i, addr)| (addr.clone(), i as u64))
+            .collect();
+
+        // Map numeric NodeId strings ("1", "2", …) to network addresses.
+        // peers[i] has node_id = i+1, so its Raft NodeId is "(i+1)".
+        let node_id_to_address: HashMap<NodeId, String> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| ((i as u64 + 1).to_string(), addr.clone()))
             .collect();
 
         // Peer NodeIds are the raw address strings; base URLs add the http:// scheme
@@ -337,6 +350,7 @@ impl RaftNode {
             state: raft_state,
             log: raft_log,
             peer_id_map,
+            node_id_to_address,
             propose_tx,
             commit_callbacks,
             storage,
@@ -371,14 +385,23 @@ impl RaftNode {
         let state = self.state.try_lock().ok()?;
         let leader_node_id: &NodeId = state.volatile.current_leader.as_ref()?;
 
-        // If this node is the leader, return its own numeric ID and NodeId string.
+        // Translate the Raft NodeId (a numeric string like "1") to the
+        // real network address using the map built from the peers list.
+        // Falls back to the raw NodeId if it is already an address.
+        let address = self
+            .node_id_to_address
+            .get(leader_node_id)
+            .cloned()
+            .unwrap_or_else(|| leader_node_id.clone());
+
+        // If this node is the leader, return its own numeric ID.
         if leader_node_id == &state.id {
-            return Some((self.node_id, leader_node_id.clone()));
+            return Some((self.node_id, address));
         }
 
         // For a peer leader, look up the numeric ID assigned in `new`.
         let numeric_id = self.peer_id_map.get(leader_node_id).copied().unwrap_or(0);
-        Some((numeric_id, leader_node_id.clone()))
+        Some((numeric_id, address))
     }
 
     /// Handle an incoming `RequestVote` RPC from a candidate.
