@@ -177,10 +177,7 @@ impl RaftNode {
         let commit_notify = Arc::new(Notify::new());
 
         // --- Election timer --------------------------------------------------
-        let timer = Arc::new(ElectionTimer::start(
-            election_config,
-            election_timeout_tx,
-        ));
+        let timer = Arc::new(ElectionTimer::start(election_config, election_timeout_tx));
 
         // --- Commit callbacks (created before event loop so both sides can hold it) ---
         type CbVec = Vec<Box<dyn Fn(Command) + Send + 'static>>;

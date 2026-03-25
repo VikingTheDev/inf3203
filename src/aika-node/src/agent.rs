@@ -243,7 +243,8 @@ async fn process_batch(
     assignment: &TaskAssignment,
 ) -> anyhow::Result<Vec<(String, String)>> {
     // Build full paths and a reverse map back to the original relative names.
-    let mut full_to_rel: HashMap<String, String> = HashMap::with_capacity(assignment.image_paths.len());
+    let mut full_to_rel: HashMap<String, String> =
+        HashMap::with_capacity(assignment.image_paths.len());
     let mut stdin_buf = String::new();
     for image_path in &assignment.image_paths {
         let full_path = format!("{}/{}", config.image_base_path, image_path);
@@ -297,7 +298,10 @@ async fn process_batch(
     }
 
     if results.is_empty() {
-        anyhow::bail!("Batch classifier produced no results for {} images", assignment.image_paths.len());
+        anyhow::bail!(
+            "Batch classifier produced no results for {} images",
+            assignment.image_paths.len()
+        );
     }
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);

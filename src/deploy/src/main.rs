@@ -136,10 +136,7 @@ fn ssh_run(node: &str, cmd: &str) -> bool {
 /// SSH to `node` and start an Aika node as a detached background process.
 /// stdout and stderr are appended to `log_file` (must be an NFS path visible from the remote node).
 fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
-    let cmd = format!(
-        "nohup {} {} </dev/null >>{} 2>&1 &",
-        binary, args, log_file
-    );
+    let cmd = format!("nohup {} {} </dev/null >>{} 2>&1 &", binary, args, log_file);
     ssh_run(node, &cmd)
 }
 
@@ -166,7 +163,10 @@ fn ensure_venv(install_dir: &Path, classify_script: &Path) -> PathBuf {
     }
 
     // Derive requirements.txt path: it lives next to classify.py
-    let requirements = classify_script.parent().unwrap_or(install_dir).join("requirements.txt");
+    let requirements = classify_script
+        .parent()
+        .unwrap_or(install_dir)
+        .join("requirements.txt");
     if requirements.exists() {
         println!("Installing packages from {}…", requirements.display());
         let pip = venv_dir.join("bin/pip");
@@ -281,7 +281,7 @@ fn ensure_binary(install_dir: &Path) -> PathBuf {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <num_nodes>", args[0]);
+        eprintln!("Usage: {} <num_nodes> [max_images]", args[0]);
         eprintln!("       {} cleanup", args[0]);
         eprintln!("       {} merge", args[0]);
         eprintln!();
@@ -291,6 +291,9 @@ fn main() {
             "  Minimum: {} nodes (one Raft quorum). Recommended: 10+.",
             NUM_CC
         );
+        eprintln!();
+        eprintln!("  max_images  Optional: limit the total number of images to process.");
+        eprintln!("              Default: 0 (unlimited — process all images).");
         eprintln!();
         eprintln!("  cleanup  Remove Raft state dirs on all previously-deployed nodes.");
         eprintln!("  merge    Deduplicate results_*.ndjson into results_final.ndjson.");
@@ -312,6 +315,16 @@ fn main() {
     let num_nodes: usize = args[1]
         .parse()
         .expect("num_nodes must be a positive integer");
+
+    let max_images: u64 = if args.len() > 2 {
+        args[2].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    if max_images > 0 {
+        println!("Image limit: {} images", max_images);
+    }
 
     if num_nodes < NUM_CC {
         eprintln!(
@@ -414,8 +427,9 @@ fn main() {
             "cluster-controller --node-id {} --bind 0.0.0.0:{} --peers {} --image-dir {} \
              --data-dir {} --results-dir {} \
              --batch-size 50 --task-ttl-secs 600 \
-             --heartbeat-interval-ms 500 --election-timeout-min-ms 2000 --election-timeout-max-ms 5000",
-            node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str
+             --heartbeat-interval-ms 500 --election-timeout-min-ms 2000 --election-timeout-max-ms 5000 \
+             --max-images {}",
+            node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str, max_images
         );
         let log_file = format!("{}/cc-{}.log", log_dir_str, node_id);
         // Wipe old Raft state on the target node (start fresh every time we deploy new cluster)
@@ -543,6 +557,7 @@ fn main() {
             peer_list: peer_list.clone(),
             log_dir: log_dir_str,
             python: venv_python_str.to_string(),
+            cc_addrs: cc_started.clone(),
         };
         lc_watchdog(lc_watchlist, cc_watchlist, ctx);
     }
@@ -575,6 +590,8 @@ struct WatchdogContext {
     peer_list: String,
     log_dir: String,
     python: String,
+    /// CC addresses for polling /status (e.g. ["c6-0:50123", "c6-1:50456"]).
+    cc_addrs: Vec<String>,
 }
 
 /// One entry in the watchdog's tracking list.
@@ -586,6 +603,362 @@ struct WatchdogEntry {
     failed_attempts: u32,
     /// When we first detected this node as down in the current failure episode.
     down_since: Option<std::time::Instant>,
+}
+
+/// Telemetry snapshot received from the CC /status endpoint.
+#[derive(Default, Clone, serde::Deserialize)]
+struct StatusResponse {
+    total_tasks: u64,
+    pending_tasks: u64,
+    assigned_tasks: u64,
+    completed_tasks: u64,
+    registered_nodes: Vec<NodeInfoResp>,
+    stale_nodes: Vec<String>,
+    telemetry: TelemetryResp,
+}
+
+#[derive(Default, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+struct NodeInfoResp {
+    node_id: String,
+    agent_count: usize,
+}
+
+#[derive(Default, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+struct TelemetryResp {
+    total_images: u64,
+    completed_images: u64,
+    ttl_expirations: u64,
+    total_assignments: u64,
+    total_completions: u64,
+    first_completion_at: Option<u64>,
+    last_completion_at: Option<u64>,
+    started_at: Option<u64>,
+    per_node_completions: Vec<(String, u64)>,
+    per_node_images: Vec<(String, u64)>,
+    batch_size: usize,
+    max_images: u64,
+}
+
+/// Dashboard state accumulated across polling cycles.
+struct DashboardState {
+    lc_crashes: u32,
+    lc_restarts: u32,
+    cc_crashes: u32,
+    cc_restarts: u32,
+    lc_replacements: u32,
+    /// History of (unix_timestamp, completed_batches) for throughput calculation.
+    throughput_history: Vec<(u64, u64)>,
+    last_status: Option<StatusResponse>,
+    start_time: std::time::Instant,
+}
+
+/// Poll one of the CC addresses for the /status endpoint.
+fn poll_status(cc_addrs: &[String]) -> Option<StatusResponse> {
+    for addr in cc_addrs {
+        let url = format!("http://{}/status", addr);
+        let output = Command::new("curl")
+            .args(["-s", "--connect-timeout", "3", "--max-time", "5"])
+            .arg(&url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(status) = serde_json::from_slice::<StatusResponse>(&out.stdout) {
+                    return Some(status);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render a progress bar: [████████░░░░░░░░] 42%
+fn progress_bar(completed: u64, total: u64, width: usize) -> String {
+    if total == 0 {
+        return format!("[{}] 0%", "░".repeat(width));
+    }
+    let pct = (completed as f64 / total as f64).min(1.0);
+    let filled = (pct * width as f64) as usize;
+    let empty = width.saturating_sub(filled);
+    format!(
+        "[{}{}] {:.1}%",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        pct * 100.0
+    )
+}
+
+/// Format a duration into human-readable form.
+fn fmt_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{}h{:02}m{:02}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m{:02}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+/// Format a large number with commas.
+fn fmt_num(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// Render the dashboard to stderr (preserving stdout for structured output).
+fn render_dashboard(state: &DashboardState) {
+    // Clear screen and move cursor to top.
+    eprint!("\x1b[2J\x1b[H");
+
+    let elapsed = state.start_time.elapsed().as_secs();
+    let w = 70; // box inner width
+    let line = "═".repeat(w);
+    let dash = "─".repeat(w);
+
+    eprintln!("╔{}╗", line);
+    eprintln!(
+        "║{:^width$}║",
+        format!("Áika Cluster Dashboard  ({})", fmt_duration(elapsed)),
+        width = w
+    );
+    eprintln!("╠{}╣", line);
+
+    if let Some(ref status) = state.last_status {
+        let t = &status.telemetry;
+
+        // Batch progress
+        let batch_bar = progress_bar(status.completed_tasks, status.total_tasks, 30);
+        pline(
+            w,
+            &format!(
+                "Batches:  {} {:>8} / {:<8}",
+                batch_bar,
+                fmt_num(status.completed_tasks),
+                fmt_num(status.total_tasks)
+            ),
+        );
+
+        // Image progress
+        let img_bar = progress_bar(t.completed_images, t.total_images, 30);
+        pline(
+            w,
+            &format!(
+                "Images:   {} {:>8} / {:<8}",
+                img_bar,
+                fmt_num(t.completed_images),
+                fmt_num(t.total_images)
+            ),
+        );
+
+        eprintln!("╟{}╢", dash);
+
+        // Task status breakdown
+        pline(
+            w,
+            &format!(
+                "Pending: {:<10}  Assigned: {:<10}  Completed: {:<10}",
+                fmt_num(status.pending_tasks),
+                fmt_num(status.assigned_tasks),
+                fmt_num(status.completed_tasks)
+            ),
+        );
+
+        // Throughput calculation
+        let throughput_batches = if state.throughput_history.len() >= 2 {
+            let (t1, c1) = state.throughput_history.first().unwrap();
+            let (t2, c2) = state.throughput_history.last().unwrap();
+            let dt = t2.saturating_sub(*t1);
+            if dt > 0 {
+                (c2 - c1) as f64 / dt as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let throughput_images = throughput_batches * t.batch_size as f64;
+
+        // Recent throughput (last 60s window)
+        let recent_throughput = if state.throughput_history.len() >= 2 {
+            let now_entry = state.throughput_history.last().unwrap();
+            let cutoff = now_entry.0.saturating_sub(60);
+            let old_entry = state
+                .throughput_history
+                .iter()
+                .rev()
+                .find(|(ts, _)| *ts <= cutoff)
+                .unwrap_or(state.throughput_history.first().unwrap());
+            let dt = now_entry.0.saturating_sub(old_entry.0);
+            if dt > 0 {
+                ((now_entry.1 - old_entry.1) as f64 / dt as f64) * t.batch_size as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        pline(
+            w,
+            &format!(
+                "Throughput (avg):    {:>8.1} img/s  ({:.2} batch/s)",
+                throughput_images, throughput_batches
+            ),
+        );
+        pline(
+            w,
+            &format!("Throughput (recent): {:>8.1} img/s", recent_throughput),
+        );
+
+        // ETA
+        if throughput_images > 0.0 && t.total_images > t.completed_images {
+            let remaining = t.total_images - t.completed_images;
+            let eta_secs = (remaining as f64 / throughput_images) as u64;
+            pline(
+                w,
+                &format!(
+                    "ETA: {} ({} images remaining)",
+                    fmt_duration(eta_secs),
+                    fmt_num(remaining)
+                ),
+            );
+        } else if status.completed_tasks == status.total_tasks && status.total_tasks > 0 {
+            pline(w, "✅ ALL TASKS COMPLETED");
+        } else {
+            pline(w, "ETA: calculating…");
+        }
+
+        if t.max_images > 0 {
+            pline(
+                w,
+                &format!("Max images: {} (limited)", fmt_num(t.max_images)),
+            );
+        }
+
+        eprintln!("╟{}╢", dash);
+        pline(w, "Fault Tolerance");
+        pline(
+            w,
+            &format!(
+                "TTL expirations: {:<6}  Assignments: {:<8}  Completions: {}",
+                t.ttl_expirations,
+                fmt_num(t.total_assignments),
+                fmt_num(t.total_completions)
+            ),
+        );
+        pline(
+            w,
+            &format!(
+                "LC crashes: {:<4}  LC restarts: {:<4}  LC replacements: {}",
+                state.lc_crashes, state.lc_restarts, state.lc_replacements
+            ),
+        );
+        pline(
+            w,
+            &format!(
+                "CC crashes: {:<4}  CC restarts: {}",
+                state.cc_crashes, state.cc_restarts
+            ),
+        );
+
+        if !status.stale_nodes.is_empty() {
+            pline(
+                w,
+                &format!("⚠ Stale nodes: {}", status.stale_nodes.join(", ")),
+            );
+        }
+
+        eprintln!("╟{}╢", dash);
+        pline(w, "Per-Node Throughput");
+
+        let max_img = t.per_node_images.iter().map(|(_, c)| *c).max().unwrap_or(1);
+        for (node_id, img_count) in t.per_node_images.iter().take(15) {
+            let bar_width: usize = 20;
+            let filled = if max_img > 0 {
+                ((*img_count as f64 / max_img as f64) * bar_width as f64) as usize
+            } else {
+                0
+            };
+            let empty = bar_width.saturating_sub(filled);
+            let batch_count = t
+                .per_node_completions
+                .iter()
+                .find(|(n, _)| n == node_id)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            let display_id: &str = if node_id.len() > 14 {
+                &node_id[..14]
+            } else {
+                node_id
+            };
+            pline(
+                w,
+                &format!(
+                    "{:<14} [{}{}] {:>8} img {:>5} bat",
+                    display_id,
+                    "█".repeat(filled),
+                    "░".repeat(empty),
+                    fmt_num(*img_count),
+                    fmt_num(batch_count)
+                ),
+            );
+        }
+
+        if t.per_node_images.is_empty() {
+            pline(w, "(no completions yet)");
+        }
+
+        eprintln!("╟{}╢", dash);
+        let total_agents: usize = status.registered_nodes.iter().map(|n| n.agent_count).sum();
+        let active_lcs = status
+            .registered_nodes
+            .iter()
+            .filter(|n| n.agent_count > 0)
+            .count();
+        let replica_lcs = status
+            .registered_nodes
+            .iter()
+            .filter(|n| n.agent_count == 0)
+            .count();
+        pline(
+            w,
+            &format!(
+                "Nodes: {} active LC, {} replica, {} total agents",
+                active_lcs, replica_lcs, total_agents
+            ),
+        );
+    } else {
+        pline(w, "Waiting for cluster status…");
+        pline(w, "(CCs may still be electing a leader)");
+    }
+
+    eprintln!("╚{}╝", line);
+    eprintln!("  Press Ctrl+C to stop watchdog.");
+}
+
+/// Print a padded line inside the box: ║  content...              ║
+fn pline(width: usize, content: &str) {
+    let inner = width - 2; // 2 chars for "  " prefix
+    if content.len() <= inner {
+        eprintln!("║  {:<inner$}║", content, inner = inner);
+    } else {
+        eprintln!("║  {}║", &content[..inner]);
+    }
 }
 
 /// Periodically checks that every LC process is still running.
@@ -603,11 +976,13 @@ fn lc_watchdog(
     ctx: WatchdogContext,
 ) {
     // How often to poll each LC node.
-    const INTERVAL_SECS: u64 = 30;
+    const INTERVAL_SECS: u64 = 10;
     // Must be > 2 × lc_heartbeat_timeout_secs (default 60s).
     const RESTART_DELAY_SECS: u64 = 150;
     // Consecutive SSH failures before we give up and pick a replacement node.
     const MAX_RESTART_ATTEMPTS: u32 = 3;
+    // How many throughput history entries to keep (for sliding window calculation).
+    const MAX_HISTORY: usize = 360; // ~1 hour at 10s interval
 
     let mut lc_entries: Vec<WatchdogEntry> = lc_watchlist
         .into_iter()
@@ -622,16 +997,47 @@ fn lc_watchdog(
     // CC entries: (node, binary, args) — stored separately, no replacement logic.
     let cc_entries: Vec<(String, String, String)> = cc_watchlist;
 
+    let mut dashboard = DashboardState {
+        lc_crashes: 0,
+        lc_restarts: 0,
+        cc_crashes: 0,
+        cc_restarts: 0,
+        lc_replacements: 0,
+        throughput_history: Vec::new(),
+        last_status: None,
+        start_time: std::time::Instant::now(),
+    };
+
     loop {
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
+
+        // --- Poll cluster status for dashboard ---
+        if let Some(status) = poll_status(&ctx.cc_addrs) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            dashboard
+                .throughput_history
+                .push((now, status.completed_tasks));
+            if dashboard.throughput_history.len() > MAX_HISTORY {
+                dashboard.throughput_history.remove(0);
+            }
+            dashboard.last_status = Some(status);
+        }
+
+        // --- Render dashboard ---
+        render_dashboard(&dashboard);
 
         // --- CC monitoring: restart on same node, no replacement ---
         for (node, binary, args) in cc_entries.iter() {
             let alive = ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1");
             if !alive {
+                dashboard.cc_crashes += 1;
                 eprintln!("[watchdog] CC on {} not running — restarting…", node);
                 let log_file = format!("{}/cc-{}.log", ctx.log_dir, node);
                 if ssh_start(node, binary, args, &log_file) {
+                    dashboard.cc_restarts += 1;
                     eprintln!("[watchdog] CC on {} restarted ok", node);
                 } else {
                     eprintln!(
@@ -659,6 +1065,9 @@ fn lc_watchdog(
             }
 
             // Node is down — record when we first noticed.
+            if entry.down_since.is_none() {
+                dashboard.lc_crashes += 1;
+            }
             let first_down = entry.down_since.get_or_insert_with(std::time::Instant::now);
             let down_secs = first_down.elapsed().as_secs();
 
@@ -681,6 +1090,7 @@ fn lc_watchdog(
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, entry.node);
             if ssh_start(&entry.node, &ctx.binary, &entry.restart_args, &log_file) {
                 eprintln!("[watchdog] LC on {} restarted ok", entry.node);
+                dashboard.lc_restarts += 1;
                 entry.down_since = None;
                 entry.failed_attempts = 0;
                 continue;
@@ -747,6 +1157,7 @@ fn lc_watchdog(
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, new_node);
             if ssh_start(&new_node, &ctx.binary, &new_restart_args, &log_file) {
                 eprintln!("[watchdog] Replacement LC on {} started ok", new_node);
+                dashboard.lc_replacements += 1;
                 entry.node = new_node;
                 entry.restart_args = new_restart_args;
                 entry.down_since = None;

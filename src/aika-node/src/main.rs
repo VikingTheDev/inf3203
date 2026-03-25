@@ -70,6 +70,11 @@ enum Role {
         /// Maximum Raft election timeout in milliseconds.
         #[arg(long, default_value = "300")]
         election_timeout_max_ms: u64,
+
+        /// Maximum number of images to process (0 = unlimited, processes all images).
+        /// Useful for testing with a smaller subset.
+        #[arg(long, default_value = "0")]
+        max_images: u64,
     },
 
     /// Run as a local controller (monitors agents on this physical node)
@@ -158,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_interval_ms,
             election_timeout_min_ms,
             election_timeout_max_ms,
+            max_images,
         } => {
             let username = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
             let data_dir =
@@ -180,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
                 heartbeat_interval_ms,
                 election_timeout_min_ms,
                 election_timeout_max_ms,
+                max_images,
             };
             cluster_controller::run(config).await
         }

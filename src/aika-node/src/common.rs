@@ -144,6 +144,37 @@ pub struct ClusterStatus {
     pub registered_nodes: Vec<NodeInfo>,
     /// Node IDs of local controllers that have not sent a heartbeat recently.
     pub stale_nodes: Vec<String>,
+    /// Telemetry counters for observability.
+    pub telemetry: ClusterTelemetry,
+}
+
+/// Detailed telemetry for the cluster — exposed via GET /status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClusterTelemetry {
+    /// Total images across all batches.
+    pub total_images: u64,
+    /// Total images in completed batches.
+    pub completed_images: u64,
+    /// Number of TTL expirations since cluster start.
+    pub ttl_expirations: u64,
+    /// Number of task assignments made.
+    pub total_assignments: u64,
+    /// Number of task completions received.
+    pub total_completions: u64,
+    /// Unix timestamp when the first batch was completed.
+    pub first_completion_at: Option<u64>,
+    /// Unix timestamp of the most recent batch completion.
+    pub last_completion_at: Option<u64>,
+    /// Unix timestamp when the cluster started (leader first elected).
+    pub started_at: Option<u64>,
+    /// Per-node completion counts: node_id -> batches completed by agents on that node.
+    pub per_node_completions: Vec<(String, u64)>,
+    /// Per-node image counts: node_id -> images completed by agents on that node.
+    pub per_node_images: Vec<(String, u64)>,
+    /// Number of images per batch (configuration value).
+    pub batch_size: usize,
+    /// Max images configured (0 = unlimited).
+    pub max_images: u64,
 }
 
 /// Agent -> Local controller: periodic heartbeat with current status

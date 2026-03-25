@@ -36,6 +36,8 @@ pub struct ClusterControllerConfig {
     pub election_timeout_min_ms: u64,
     /// Maximum Raft election timeout in milliseconds.
     pub election_timeout_max_ms: u64,
+    /// Maximum number of images to process (0 = unlimited).
+    pub max_images: u64,
 }
 
 // endregion
@@ -50,15 +52,40 @@ struct StateMachine {
     /// O(1) queue of batch IDs that are ready to be assigned.
     /// Stale entries (already assigned/completed) are lazily skipped.
     pending_queue: VecDeque<u64>,
+    // -- Telemetry counters --
+    ttl_expirations: u64,
+    total_assignments: u64,
+    total_completions: u64,
+    first_completion_at: Option<u64>,
+    last_completion_at: Option<u64>,
+    started_at: Option<u64>,
+    /// agent_id -> batches completed
+    per_agent_completions: HashMap<String, u64>,
+    /// agent_id -> images completed
+    per_agent_images: HashMap<String, u64>,
+    /// Configured batch size (for telemetry reporting).
+    batch_size: usize,
+    /// Max images configured (for telemetry reporting).
+    max_images: u64,
 }
 
 impl StateMachine {
-    fn new() -> Self {
+    fn new(batch_size: usize, max_images: u64) -> Self {
         StateMachine {
             tasks: HashMap::new(),
             nodes: HashMap::new(),
             next_batch_id: 0,
             pending_queue: VecDeque::new(),
+            ttl_expirations: 0,
+            total_assignments: 0,
+            total_completions: 0,
+            first_completion_at: None,
+            last_completion_at: None,
+            started_at: None,
+            per_agent_completions: HashMap::new(),
+            per_agent_images: HashMap::new(),
+            batch_size,
+            max_images,
         }
     }
 
@@ -99,6 +126,10 @@ impl StateMachine {
                             agent_id,
                             assigned_at,
                         };
+                        self.total_assignments += 1;
+                        if self.started_at.is_none() {
+                            self.started_at = Some(unix_now());
+                        }
                     }
                     // Already Assigned or Completed — no-op (idempotent).
                 }
@@ -107,8 +138,24 @@ impl StateMachine {
             Command::CompleteTask { batch_id, labels } => {
                 if let Some(batch) = self.tasks.get_mut(&batch_id) {
                     if batch.status != TaskStatus::Completed {
+                        let image_count = labels.len() as u64;
+                        // Track which agent completed this batch.
+                        if let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
+                            *self
+                                .per_agent_completions
+                                .entry(agent_id.clone())
+                                .or_insert(0) += 1;
+                            *self.per_agent_images.entry(agent_id.clone()).or_insert(0) +=
+                                image_count;
+                        }
                         batch.labels = labels.into_iter().collect();
                         batch.status = TaskStatus::Completed;
+                        self.total_completions += 1;
+                        let now = unix_now();
+                        if self.first_completion_at.is_none() {
+                            self.first_completion_at = Some(now);
+                        }
+                        self.last_completion_at = Some(now);
                     }
                     // Already Completed — no-op (idempotent).
                 }
@@ -119,6 +166,7 @@ impl StateMachine {
                     if matches!(batch.status, TaskStatus::Assigned { .. }) {
                         batch.status = TaskStatus::Pending;
                         self.pending_queue.push_back(batch_id);
+                        self.ttl_expirations += 1;
                     }
                 }
             }
@@ -182,12 +230,19 @@ impl StateMachine {
         let mut pending = 0u64;
         let mut assigned = 0u64;
         let mut completed = 0u64;
+        let mut total_images = 0u64;
+        let mut completed_images = 0u64;
 
         for b in self.tasks.values() {
+            let img_count = b.image_paths.len() as u64;
+            total_images += img_count;
             match b.status {
                 TaskStatus::Pending => pending += 1,
                 TaskStatus::Assigned { .. } => assigned += 1,
-                TaskStatus::Completed => completed += 1,
+                TaskStatus::Completed => {
+                    completed += 1;
+                    completed_images += img_count;
+                }
             }
         }
 
@@ -198,6 +253,39 @@ impl StateMachine {
             .map(|n| n.node_id.clone())
             .collect();
 
+        // Aggregate per-agent stats into per-node stats.
+        // Agent IDs follow the pattern: "<node_id>-agent-<N>"
+        let mut per_node_completions: HashMap<String, u64> = HashMap::new();
+        let mut per_node_images: HashMap<String, u64> = HashMap::new();
+        for (agent_id, count) in &self.per_agent_completions {
+            let node_id = agent_id_to_node(agent_id);
+            *per_node_completions.entry(node_id).or_insert(0) += count;
+        }
+        for (agent_id, count) in &self.per_agent_images {
+            let node_id = agent_id_to_node(agent_id);
+            *per_node_images.entry(node_id).or_insert(0) += count;
+        }
+
+        let mut pnc: Vec<(String, u64)> = per_node_completions.into_iter().collect();
+        pnc.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut pni: Vec<(String, u64)> = per_node_images.into_iter().collect();
+        pni.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let telemetry = ClusterTelemetry {
+            total_images,
+            completed_images,
+            ttl_expirations: self.ttl_expirations,
+            total_assignments: self.total_assignments,
+            total_completions: self.total_completions,
+            first_completion_at: self.first_completion_at,
+            last_completion_at: self.last_completion_at,
+            started_at: self.started_at,
+            per_node_completions: pnc,
+            per_node_images: pni,
+            batch_size: self.batch_size,
+            max_images: self.max_images,
+        };
+
         ClusterStatus {
             total_tasks: self.tasks.len() as u64,
             pending_tasks: pending,
@@ -205,6 +293,7 @@ impl StateMachine {
             completed_tasks: completed,
             registered_nodes: self.nodes.values().cloned().collect(),
             stale_nodes,
+            telemetry,
         }
     }
 }
@@ -243,6 +332,7 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
     let lc_timeout_secs = config.lc_heartbeat_timeout_secs;
     let node_id = config.node_id;
     let results_dir = config.results_dir.clone();
+    let max_images = config.max_images;
 
     // Ensure the results directory exists (may be on NFS).
     std::fs::create_dir_all(&config.results_dir)?;
@@ -263,7 +353,8 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
         election_config,
         replication_config,
     );
-    let sm: Arc<Mutex<StateMachine>> = Arc::new(Mutex::new(StateMachine::new()));
+    let sm: Arc<Mutex<StateMachine>> =
+        Arc::new(Mutex::new(StateMachine::new(batch_size, max_images)));
 
     // Register the state machine's apply function as a Raft commit callback.
     // This runs synchronously from inside the event loop — no await, no deadlock.
@@ -308,7 +399,7 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
                 }
                 if !was_leader || !ingestion_complete {
                     ingestion_complete =
-                        ingest_image_tasks(&ingest_app, &image_dir, batch_size).await;
+                        ingest_image_tasks(&ingest_app, &image_dir, batch_size, max_images).await;
                     if !ingestion_complete {
                         // Back off before retrying failed ingestion.
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -573,11 +664,21 @@ async fn ttl_reaper_loop(app: AppState, ttl_secs: u64) {
 /// Uses gap detection (checks which batch IDs exist in the state machine)
 /// so it correctly fills holes left by a previous partial ingestion, and
 /// pipelines up to `MAX_IN_FLIGHT` Raft proposals for throughput.
-async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) -> bool {
+async fn ingest_image_tasks(
+    app: &AppState,
+    image_dir: &str,
+    batch_size: usize,
+    max_images: u64,
+) -> bool {
     tracing::info!(
-        "Ingesting image tasks from {} (batch_size={})",
+        "Ingesting image tasks from {} (batch_size={}, max_images={})",
         image_dir,
-        batch_size
+        batch_size,
+        if max_images == 0 {
+            "unlimited".to_string()
+        } else {
+            max_images.to_string()
+        }
     );
 
     // Collect image file names.
@@ -613,6 +714,17 @@ async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) 
     }
 
     names.sort_unstable();
+
+    // Limit the number of images if max_images is set.
+    if max_images > 0 && names.len() > max_images as usize {
+        tracing::info!(
+            "Limiting ingestion to {} of {} images (--max-images)",
+            max_images,
+            names.len()
+        );
+        names.truncate(max_images as usize);
+    }
+
     let total_batches = names.len().div_ceil(batch_size);
 
     // Find which batch IDs are missing from the state machine (handles gaps
@@ -866,7 +978,11 @@ async fn results_flush_loop(app: AppState) {
                 })
                 .collect();
             let total = sm.tasks.len();
-            let completed = sm.tasks.values().filter(|b| b.status == TaskStatus::Completed).count();
+            let completed = sm
+                .tasks
+                .values()
+                .filter(|b| b.status == TaskStatus::Completed)
+                .count();
             (new, total > 0 && completed == total, total)
         };
 
@@ -912,10 +1028,7 @@ async fn results_flush_loop(app: AppState) {
 
         // Once every task is done, write the final labeled_data.json.
         if all_done && !final_written {
-            tracing::info!(
-                "All {} tasks completed — writing labeled_data.json",
-                total
-            );
+            tracing::info!("All {} tasks completed — writing labeled_data.json", total);
             write_labeled_data_json(&app).await;
             final_written = true;
         }
@@ -938,7 +1051,9 @@ async fn write_labeled_data_json(app: &AppState) {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for batch in sm.tasks.values() {
             for (image_path, label) in &batch.labels {
-                map.entry(label.clone()).or_default().push(image_path.clone());
+                map.entry(label.clone())
+                    .or_default()
+                    .push(image_path.clone());
             }
         }
         map
@@ -1046,6 +1161,16 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Extract the node portion from an agent ID.
+/// Agent IDs follow `<node_id>-agent-<N>`, e.g. `lc-c6-0-agent-2` → `lc-c6-0`.
+fn agent_id_to_node(agent_id: &str) -> String {
+    if let Some(pos) = agent_id.rfind("-agent-") {
+        agent_id[..pos].to_string()
+    } else {
+        agent_id.to_string()
+    }
 }
 
 // endregion
