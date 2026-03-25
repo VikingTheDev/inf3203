@@ -385,7 +385,7 @@ async fn heartbeat_loop(app: AppState) {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Collect the data we need from state (brief lock, no I/O).
-        let (node_id, bind_addr, agent_ids, load, agent_count, extractor_script, image_base_path, python) = {
+        let (node_id, routable_addr, agent_ids, load, agent_count, extractor_script, image_base_path, python) = {
             let g = app.state.lock().await;
             let agent_ids: Vec<String> = g.agents.keys().cloned().collect();
             let in_flight = g
@@ -398,9 +398,13 @@ async fn heartbeat_loop(app: AppState) {
             } else {
                 in_flight / agent_ids.len() as f64
             };
+            // Use the hostname from node_id (strip "lc-" prefix) so the CC
+            // gets a routable address instead of "0.0.0.0".
+            let hostname = g.config.node_id.strip_prefix("lc-").unwrap_or(&g.config.node_id);
+            let addr = format!("{}:{}", hostname, g.config.bind.port());
             (
                 g.config.node_id.clone(),
-                g.config.bind.to_string(),
+                addr,
                 agent_ids,
                 load,
                 g.config.agent_count,
@@ -412,7 +416,7 @@ async fn heartbeat_loop(app: AppState) {
 
         let req = HeartbeatRequest {
             node_id,
-            address: bind_addr,
+            address: routable_addr,
             agent_ids,
             load,
             agent_count,
