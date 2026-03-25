@@ -271,9 +271,11 @@ async fn run_feature_extractor(python: &str, script_path: &str, image_path: &str
     let label = String::from_utf8(output.stdout)
         .map_err(|e| anyhow::anyhow!("Non-UTF8 output from feature extractor: {}", e))?;
 
-    // Take the first non-empty line as the label.
+    // Take the last non-empty line as the label.
+    // classify.py prints "Reading image ..." first, then the actual label.
     let label = label
         .lines()
+        .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
