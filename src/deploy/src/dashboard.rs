@@ -968,7 +968,7 @@ fn kill_node(hostname: &str, log_buf: &LogBuffer) {
                 "StrictHostKeyChecking=no",
                 &hostname,
             ])
-            .arg("pkill -f inf3203_aika")
+            .arg("pkill -f '[i]nf3203_aika'; pkill -f -- '--agent-id'; true")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -995,6 +995,10 @@ fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
     let log_buf = log_buf.clone();
     std::thread::spawn(move || {
         log_buf.push(format!("⚡ Killing one agent on {}…", hostname));
+
+        // Count agents before kill.
+        let before = count_agents_on(&hostname);
+
         // Find the oldest agent process (by PID, lowest = oldest) and kill it.
         // Agents are spawned via current_exe() which resolves the symlink to
         // the real binary name (aika-node), so match on --agent-id flag instead.
@@ -1015,7 +1019,27 @@ fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
             .status();
         match result {
             Ok(s) if s.success() => {
-                log_buf.push(format!("⚡ Killed one agent on {}", hostname));
+                // Brief wait to let the kill take effect.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let after = count_agents_on(&hostname);
+                log_buf.push(format!(
+                    "⚡ Killed agent on {} (agents: {} → {})",
+                    hostname, before, after
+                ));
+                // Wait for LC to respawn, then report.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let recovered = count_agents_on(&hostname);
+                if recovered > after {
+                    log_buf.push(format!(
+                        "↻ LC on {} respawned agent (agents: {} → {})",
+                        hostname, after, recovered
+                    ));
+                } else if recovered == after {
+                    log_buf.push(format!(
+                        "⚠ Agent on {} not respawned yet (still {})",
+                        hostname, recovered
+                    ));
+                }
             }
             Ok(_) => {
                 log_buf.push(format!(
@@ -1028,6 +1052,29 @@ fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
             }
         }
     });
+}
+
+/// Count the number of agent processes running on a remote host.
+fn count_agents_on(hostname: &str) -> u32 {
+    let output = std::process::Command::new("ssh")
+        .args([
+            "-n",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=no",
+            hostname,
+        ])
+        .arg("pgrep -fc -- '--agent-id' || true")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 /// Read results NDJSON files, deduplicate by batch_id, and count images per label.

@@ -152,7 +152,7 @@ fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
     }
     // Give the process a moment to start (or crash immediately).
     thread::sleep(Duration::from_secs(2));
-    ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1")
+    ssh_run(node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1")
 }
 
 /// Ensure a Python virtual environment with the required packages exists in
@@ -563,7 +563,7 @@ fn main() {
                 log_msg!(log_buf, "  LC [{}] {} @ {} … FAILED (no port/ssh)", launch.label, launch.node_id, launch.node);
                 continue;
             }
-            let alive = ssh_run(&launch.node, "pgrep -f inf3203_aika > /dev/null 2>&1");
+            let alive = ssh_run(&launch.node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1");
             if alive {
                 log_msg!(log_buf, "  LC [{}] {} @ {}:{} … ok", launch.label, launch.node_id, launch.node, launch.port);
                 lc_started += 1;
@@ -1054,7 +1054,7 @@ fn cc_monitor(
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
         for (i, (node, binary, args)) in cc_entries.iter().enumerate() {
-            let alive = ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1");
+            let alive = ssh_run(node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1");
             if alive {
                 was_down[i] = false;
                 continue;
@@ -1120,7 +1120,7 @@ fn lc_monitor(
             lc_entries.iter().map(|e| e.node.clone()).collect();
 
         for entry in lc_entries.iter_mut() {
-            let alive = ssh_run(&entry.node, "pgrep -f inf3203_aika > /dev/null 2>&1");
+            let alive = ssh_run(&entry.node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1");
             if alive {
                 if entry.down_since.take().is_some() {
                     log_msg!(log_buf, "[watchdog] LC on {} recovered", entry.node);
