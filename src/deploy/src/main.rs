@@ -9,6 +9,8 @@
 ///   Nodes 1–3  →  Cluster Controller  (3-node Raft quorum)
 ///   Node  4    →  Local Controller replica  (--agents 0, standby)
 ///   Nodes 5–N  →  Local Controller active   (--agents 4)
+mod dashboard;
+
 use rand::Rng;
 use rand::seq::SliceRandom;
 use std::env;
@@ -17,15 +19,18 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use dashboard::{DeployInfo, LogBuffer};
 
 // region Constants
 
 const VERSION: &str = "v0.0.1"; // replaced by CI at release
 
 const NUM_CC: usize = 3;
-const AGENTS_PER_LC: usize = 2;
+const AGENTS_PER_LC: usize = 4;
 
 const IMAGE_DIR: &str = "/share/inf3203/unlabeled_images";
 
@@ -136,39 +141,39 @@ fn ssh_run(node: &str, cmd: &str) -> bool {
 /// SSH to `node` and start an Aika node as a detached background process.
 /// stdout and stderr are appended to `log_file` (must be an NFS path visible from the remote node).
 fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
-    let cmd = format!("nohup {} {} </dev/null >>{} 2>&1 &", binary, args, log_file);
+    let cmd = format!(
+        "nohup {} {} </dev/null >>{} 2>&1 &",
+        binary, args, log_file
+    );
     ssh_run(node, &cmd)
 }
 
 /// Ensure a Python virtual environment with the required packages exists in
 /// `install_dir/inf3203_venv`. Returns the path to the venv's `python` binary.
-fn ensure_venv(install_dir: &Path, classify_script: &Path) -> PathBuf {
+fn ensure_venv(install_dir: &Path, classify_script: &Path, log_buf: &LogBuffer) -> PathBuf {
     let venv_dir = install_dir.join("inf3203_venv");
     let python = venv_dir.join("bin/python");
 
     if python.exists() {
-        println!("venv already present: {}", venv_dir.display());
+        log_msg!(log_buf, "venv already present: {}", venv_dir.display());
         return python;
     }
 
-    println!("Creating Python venv at {}…", venv_dir.display());
+    log_msg!(log_buf, "Creating Python venv at {}…", venv_dir.display());
     let status = Command::new("python3")
         .args(["-m", "venv"])
         .arg(&venv_dir)
         .status()
         .expect("python3 not found — cannot create venv");
     if !status.success() {
-        eprintln!("Failed to create venv");
+        log_msg!(log_buf, "ERROR: Failed to create venv");
         std::process::exit(1);
     }
 
     // Derive requirements.txt path: it lives next to classify.py
-    let requirements = classify_script
-        .parent()
-        .unwrap_or(install_dir)
-        .join("requirements.txt");
+    let requirements = classify_script.parent().unwrap_or(install_dir).join("requirements.txt");
     if requirements.exists() {
-        println!("Installing packages from {}…", requirements.display());
+        log_msg!(log_buf, "Installing packages from {}…", requirements.display());
         let pip = venv_dir.join("bin/pip");
         let status = Command::new(&pip)
             .args(["install", "-r"])
@@ -176,25 +181,26 @@ fn ensure_venv(install_dir: &Path, classify_script: &Path) -> PathBuf {
             .status()
             .expect("pip not found in venv");
         if !status.success() {
-            eprintln!("pip install failed");
+            log_msg!(log_buf, "ERROR: pip install failed");
             std::process::exit(1);
         }
     } else {
-        eprintln!(
+        log_msg!(
+            log_buf,
             "Warning: requirements.txt not found at {}",
             requirements.display()
         );
     }
 
-    println!("venv ready: {}", python.display());
+    log_msg!(log_buf, "venv ready: {}", python.display());
     python
 }
 
 /// Ensure `classify.py` is present in `install_dir`. If not download from GitHub.
-fn ensure_classify_script(install_dir: &Path) -> PathBuf {
+fn ensure_classify_script(install_dir: &Path, log_buf: &LogBuffer) -> PathBuf {
     let dest = install_dir.join("classify.py");
     if dest.exists() {
-        println!("classify.py already present: {}", dest.display());
+        log_msg!(log_buf, "classify.py already present: {}", dest.display());
         return dest;
     }
 
@@ -202,7 +208,7 @@ fn ensure_classify_script(install_dir: &Path) -> PathBuf {
         "https://github.com/augustsh/inf3203/releases/download/{}/batch_classify.py",
         VERSION
     );
-    println!("Downloading classify.py {}…", VERSION);
+    log_msg!(log_buf, "Downloading classify.py {}…", VERSION);
 
     let status = Command::new("curl")
         .args(["-fsS", "--no-progress-meter", "-L", "-o"])
@@ -212,20 +218,20 @@ fn ensure_classify_script(install_dir: &Path) -> PathBuf {
         .expect("curl not found");
 
     if !status.success() {
-        eprintln!("Download failed: {}", url);
+        log_msg!(log_buf, "ERROR: Download failed: {}", url);
         std::process::exit(1);
     }
 
-    println!("Installed: {}", dest.display());
+    log_msg!(log_buf, "Installed: {}", dest.display());
     dest
 }
 
 /// Ensure the `aika-node` binary and `inf3203_aika` symlink are present in `install_dir`.
 /// Download binary from GitHub if absent.
-fn ensure_binary(install_dir: &Path) -> PathBuf {
+fn ensure_binary(install_dir: &Path, log_buf: &LogBuffer) -> PathBuf {
     let symlink = install_dir.join("inf3203_aika");
     if symlink.exists() {
-        println!("Binary already present: {}", symlink.display());
+        log_msg!(log_buf, "Binary already present: {}", symlink.display());
         return symlink;
     }
 
@@ -233,7 +239,7 @@ fn ensure_binary(install_dir: &Path) -> PathBuf {
         "https://github.com/augustsh/inf3203/releases/download/{}/aika-node-x86_64-unknown-linux-musl.tar.gz",
         VERSION
     );
-    println!("Downloading aika-node {}…", VERSION);
+    log_msg!(log_buf, "Downloading aika-node {}…", VERSION);
 
     let tarball = install_dir.join("aika-node.tar.gz");
     let status = Command::new("curl")
@@ -244,7 +250,7 @@ fn ensure_binary(install_dir: &Path) -> PathBuf {
         .expect("curl not found");
 
     if !status.success() {
-        eprintln!("Download failed: {}", url);
+        log_msg!(log_buf, "ERROR: Download failed: {}", url);
         std::process::exit(1);
     }
 
@@ -257,7 +263,7 @@ fn ensure_binary(install_dir: &Path) -> PathBuf {
         .expect("tar not found");
 
     if !status.success() {
-        eprintln!("Failed to extract tarball");
+        log_msg!(log_buf, "ERROR: Failed to extract tarball");
         std::process::exit(1);
     }
 
@@ -270,7 +276,7 @@ fn ensure_binary(install_dir: &Path) -> PathBuf {
     // satisfying the cluster's process-naming requirement.
     std::os::unix::fs::symlink(&binary, &symlink).expect("symlink failed");
 
-    println!("Installed: {}", symlink.display());
+    log_msg!(log_buf, "Installed: {}", symlink.display());
     symlink
 }
 
@@ -322,8 +328,11 @@ fn main() {
         0
     };
 
+    // --- Set up the log buffer that feeds into the TUI ---
+    let log_buf = LogBuffer::new(500);
+
     if max_images > 0 {
-        println!("Image limit: {} images", max_images);
+        log_msg!(log_buf, "Image limit: {} images", max_images);
     }
 
     if num_nodes < NUM_CC {
@@ -339,13 +348,13 @@ fn main() {
         .or_else(|_| env::var("LOGNAME"))
         .unwrap_or_else(|_| "unknown".into());
 
-    let binary = ensure_binary(&cwd);
+    let binary = ensure_binary(&cwd, &log_buf);
     let binary_str = binary.to_str().expect("non-UTF8 path");
 
-    let classify_script = ensure_classify_script(&cwd);
+    let classify_script = ensure_classify_script(&cwd, &log_buf);
     let classify_script_str = classify_script.to_str().expect("non-UTF8 path");
 
-    let venv_python = ensure_venv(&cwd, &classify_script);
+    let venv_python = ensure_venv(&cwd, &classify_script, &log_buf);
     let venv_python_str = venv_python.to_str().expect("non-UTF8 path");
 
     // Create the results directory on the shared filesystem so all CC nodes can
@@ -385,8 +394,9 @@ fn main() {
     candidates.shuffle(&mut rng);
 
     let nodes: Vec<String> = candidates.into_iter().take(num_nodes).collect();
-    println!(
-        "\nDeploying Áika cluster: {} nodes ({} CC, {} LC)\n",
+    log_msg!(
+        log_buf,
+        "Deploying Áika cluster: {} nodes ({} CC, {} LC)",
         nodes.len(),
         NUM_CC,
         nodes.len().saturating_sub(NUM_CC)
@@ -396,7 +406,7 @@ fn main() {
     let cc_nodes = &nodes[..NUM_CC];
     let lc_nodes = &nodes[NUM_CC..];
 
-    println!("[1/3] Assigning ports to cluster controllers…");
+    log_msg!(log_buf, "[1/3] Assigning ports to cluster controllers…");
     let mut cc_assignments: Vec<(String, u16)> = Vec::new();
     for node in cc_nodes {
         match find_free_port(node, 30) {
@@ -415,7 +425,7 @@ fn main() {
         .join(",");
 
     // start Cluster Controllers
-    println!("\n[2/3] Starting {} cluster controllers…", NUM_CC);
+    log_msg!(log_buf, "[2/3] Starting {} cluster controllers…", NUM_CC);
     let mut cc_started: Vec<String> = Vec::new();
     // (node, binary, args) — used by the watchdog to restart crashed CCs.
     let mut cc_watchlist: Vec<(String, String, String)> = Vec::new();
@@ -437,14 +447,12 @@ fn main() {
             "rm -rf {} ; nohup {} {} </dev/null >>{} 2>&1 &",
             data_dir, binary_str, node_args, log_file
         );
-        print!("  CC{} @ {}:{}  … ", node_id, node, port);
-        let _ = std::io::stdout().flush();
         if ssh_run(node, &cmd) {
-            println!("ok");
+            log_msg!(log_buf, "  CC{} @ {}:{} … ok", node_id, node, port);
             cc_started.push(format!("{}:{}", node, port));
             cc_watchlist.push((node.clone(), binary_str.to_string(), node_args));
         } else {
-            println!("FAILED");
+            log_msg!(log_buf, "  CC{} @ {}:{} … FAILED", node_id, node, port);
         }
     }
 
@@ -463,12 +471,13 @@ fn main() {
 
     // start Local Controllers
     if lc_nodes.is_empty() {
-        println!("\n[3/3] No LC nodes — CC-only deployment.");
+        log_msg!(log_buf, "[3/3] No LC nodes — CC-only deployment.");
     } else {
         let num_replica = 1.min(lc_nodes.len());
         let num_active = lc_nodes.len().saturating_sub(num_replica);
-        println!(
-            "\n[3/3] Starting {} local controllers ({} standby replica, {} active)…",
+        log_msg!(
+            log_buf,
+            "[3/3] Starting {} local controllers ({} standby replica, {} active)…",
             lc_nodes.len(),
             num_replica,
             num_active
@@ -506,18 +515,17 @@ fn main() {
             );
 
             let log_file = format!("{}/lc-{}.log", log_dir_str, node);
-            print!("  LC [{}] {} @ {}:{}  … ", label, node_id, node, port);
-            let _ = std::io::stdout().flush();
             if ssh_start(node, binary_str, &lc_args, &log_file) {
-                println!("ok");
+                log_msg!(log_buf, "  LC [{}] {} @ {}:{} … ok", label, node_id, node, port);
                 lc_started += 1;
                 lc_watchlist.push((node.clone(), binary_str.to_string(), restart_args));
             } else {
-                println!("FAILED");
+                log_msg!(log_buf, "  LC [{}] {} @ {}:{} … FAILED", label, node_id, node, port);
             }
         }
 
-        println!(
+        log_msg!(
+            log_buf,
             "  {}/{} local controllers started.",
             lc_started,
             lc_nodes.len()
@@ -530,36 +538,67 @@ fn main() {
         eprintln!("Warning: could not save node list: {}", e);
     }
 
-    println!("\n══════════════════════════════════════════");
-    println!("  Áika cluster deployed successfully");
-    println!("══════════════════════════════════════════");
-    println!("  Binary:   {}", binary_str);
-    println!("  Results:  {}", results_dir_str);
-    println!("  Logs:     {}", log_dir_str);
-    println!("  CCs:      {}", cc_started.join("  "));
-    println!();
-    println!("  Status:   curl http://{}/status", cc_started[0]);
-    println!("  Leader:   curl http://{}/leader", cc_started[0]);
-    println!("  Log tail: tail -f {}/*.log", log_dir_str);
-    println!();
-    println!(
+    log_msg!(log_buf, "══════════════════════════════════════════");
+    log_msg!(log_buf, "  Áika cluster deployed successfully");
+    log_msg!(log_buf, "══════════════════════════════════════════");
+    log_msg!(log_buf, "  Binary:   {}", binary_str);
+    log_msg!(log_buf, "  Results:  {}", results_dir_str);
+    log_msg!(log_buf, "  Logs:     {}", log_dir_str);
+    log_msg!(log_buf, "  CCs:      {}", cc_started.join("  "));
+    log_msg!(log_buf, "  Status:   curl http://{}/status", cc_started[0]);
+    log_msg!(log_buf, "  Leader:   curl http://{}/leader", cc_started[0]);
+    log_msg!(log_buf, "  Log tail: tail -f {}/*.log", log_dir_str);
+    log_msg!(
+        log_buf,
         "  Teardown: xargs -a {} -I{{}} ssh {{}} \"pkill -f inf3203_aika; true\"",
         nodes_file.display()
     );
-    println!("  Cleanup:  {} cleanup", args[0]);
-    println!("══════════════════════════════════════════");
+    log_msg!(log_buf, "  Cleanup:  {} cleanup", args[0]);
+    log_msg!(log_buf, "══════════════════════════════════════════");
 
     if !lc_watchlist.is_empty() {
-        println!("\nWatchdog running — press Ctrl+C to stop.\n");
+        log_msg!(log_buf, "Watchdog running — TUI active.");
         let ctx = WatchdogContext {
             binary: binary_str.to_string(),
             classify_script: classify_script_str.to_string(),
             peer_list: peer_list.clone(),
-            log_dir: log_dir_str,
+            log_dir: log_dir_str.clone(),
             python: venv_python_str.to_string(),
             cc_addrs: cc_started.clone(),
         };
-        lc_watchdog(lc_watchlist, cc_watchlist, ctx);
+
+        let deploy_info = DeployInfo {
+            binary: binary_str.to_string(),
+            results_dir: results_dir_str.to_string(),
+            log_dir: log_dir_str,
+            cc_addrs: cc_started.clone(),
+            num_nodes: nodes.len(),
+            num_cc: NUM_CC,
+            num_lc: nodes.len().saturating_sub(NUM_CC),
+            nodes_file: nodes_file.display().to_string(),
+        };
+
+        let dashboard_state = Arc::new(Mutex::new(DashboardState {
+            lc_crashes: 0,
+            lc_restarts: 0,
+            cc_crashes: 0,
+            cc_restarts: 0,
+            lc_replacements: 0,
+            throughput_history: Vec::new(),
+            last_status: None,
+            start_time: std::time::Instant::now(),
+        }));
+
+        // Run watchdog in a background thread; TUI runs on main thread.
+        let watchdog_state = Arc::clone(&dashboard_state);
+        let watchdog_log = log_buf.clone();
+        thread::spawn(move || {
+            lc_watchdog(lc_watchlist, cc_watchlist, ctx, watchdog_state, watchdog_log);
+        });
+
+        if let Err(e) = dashboard::run_tui(dashboard_state, deploy_info, log_buf) {
+            eprintln!("TUI error: {}", e);
+        }
     }
 }
 
@@ -618,14 +657,12 @@ struct StatusResponse {
 }
 
 #[derive(Default, Clone, serde::Deserialize)]
-#[allow(dead_code)]
 struct NodeInfoResp {
     node_id: String,
     agent_count: usize,
 }
 
 #[derive(Default, Clone, serde::Deserialize)]
-#[allow(dead_code)]
 struct TelemetryResp {
     total_images: u64,
     completed_images: u64,
@@ -658,6 +695,23 @@ struct DashboardState {
 fn poll_status(cc_addrs: &[String]) -> Option<StatusResponse> {
     for addr in cc_addrs {
         let url = format!("http://{}/status", addr);
+        // Use a simple blocking HTTP GET via std (deploy is a sync binary).
+        match std::net::TcpStream::connect_timeout(
+            &addr.parse().unwrap_or_else(|_| {
+                // addr may be hostname:port, need to resolve
+                use std::net::ToSocketAddrs;
+                addr.to_socket_addrs()
+                    .ok()
+                    .and_then(|mut i| i.next())
+                    .unwrap_or_else(|| "127.0.0.1:80".parse().unwrap())
+            }),
+            Duration::from_secs(3),
+        ) {
+            Ok(_) => {} // connection works, now do HTTP
+            Err(_) => continue,
+        }
+
+        // Use a simple approach: shell out to curl
         let output = Command::new("curl")
             .args(["-s", "--connect-timeout", "3", "--max-time", "5"])
             .arg(&url)
@@ -674,22 +728,6 @@ fn poll_status(cc_addrs: &[String]) -> Option<StatusResponse> {
         }
     }
     None
-}
-
-/// Render a progress bar: [████████░░░░░░░░] 42%
-fn progress_bar(completed: u64, total: u64, width: usize) -> String {
-    if total == 0 {
-        return format!("[{}] 0%", "░".repeat(width));
-    }
-    let pct = (completed as f64 / total as f64).min(1.0);
-    let filled = (pct * width as f64) as usize;
-    let empty = width.saturating_sub(filled);
-    format!(
-        "[{}{}] {:.1}%",
-        "█".repeat(filled),
-        "░".repeat(empty),
-        pct * 100.0
-    )
 }
 
 /// Format a duration into human-readable form.
@@ -719,261 +757,13 @@ fn fmt_num(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-/// Render the dashboard to stderr (preserving stdout for structured output).
-fn render_dashboard(state: &DashboardState) {
-    // Clear screen and move cursor to top.
-    eprint!("\x1b[2J\x1b[H");
-
-    let elapsed = state.start_time.elapsed().as_secs();
-    let w = 70; // box inner width
-    let line = "═".repeat(w);
-    let dash = "─".repeat(w);
-
-    eprintln!("╔{}╗", line);
-    eprintln!(
-        "║{:^width$}║",
-        format!("Áika Cluster Dashboard  ({})", fmt_duration(elapsed)),
-        width = w
-    );
-    eprintln!("╠{}╣", line);
-
-    if let Some(ref status) = state.last_status {
-        let t = &status.telemetry;
-
-        // Batch progress
-        let batch_bar = progress_bar(status.completed_tasks, status.total_tasks, 30);
-        pline(
-            w,
-            &format!(
-                "Batches:  {} {:>8} / {:<8}",
-                batch_bar,
-                fmt_num(status.completed_tasks),
-                fmt_num(status.total_tasks)
-            ),
-        );
-
-        // Image progress
-        let img_bar = progress_bar(t.completed_images, t.total_images, 30);
-        pline(
-            w,
-            &format!(
-                "Images:   {} {:>8} / {:<8}",
-                img_bar,
-                fmt_num(t.completed_images),
-                fmt_num(t.total_images)
-            ),
-        );
-
-        eprintln!("╟{}╢", dash);
-
-        // Task status breakdown
-        pline(
-            w,
-            &format!(
-                "Pending: {:<10}  Assigned: {:<10}  Completed: {:<10}",
-                fmt_num(status.pending_tasks),
-                fmt_num(status.assigned_tasks),
-                fmt_num(status.completed_tasks)
-            ),
-        );
-
-        // Throughput calculation
-        let throughput_batches = if state.throughput_history.len() >= 2 {
-            let (t1, c1) = state.throughput_history.first().unwrap();
-            let (t2, c2) = state.throughput_history.last().unwrap();
-            let dt = t2.saturating_sub(*t1);
-            if dt > 0 {
-                (c2 - c1) as f64 / dt as f64
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        let throughput_images = throughput_batches * t.batch_size as f64;
-
-        // Recent throughput (last 60s window)
-        let recent_throughput = if state.throughput_history.len() >= 2 {
-            let now_entry = state.throughput_history.last().unwrap();
-            let cutoff = now_entry.0.saturating_sub(60);
-            let old_entry = state
-                .throughput_history
-                .iter()
-                .rev()
-                .find(|(ts, _)| *ts <= cutoff)
-                .unwrap_or(state.throughput_history.first().unwrap());
-            let dt = now_entry.0.saturating_sub(old_entry.0);
-            if dt > 0 {
-                ((now_entry.1 - old_entry.1) as f64 / dt as f64) * t.batch_size as f64
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        pline(
-            w,
-            &format!(
-                "Throughput (avg):    {:>8.1} img/s  ({:.2} batch/s)",
-                throughput_images, throughput_batches
-            ),
-        );
-        pline(
-            w,
-            &format!("Throughput (recent): {:>8.1} img/s", recent_throughput),
-        );
-
-        // ETA
-        if throughput_images > 0.0 && t.total_images > t.completed_images {
-            let remaining = t.total_images - t.completed_images;
-            let eta_secs = (remaining as f64 / throughput_images) as u64;
-            pline(
-                w,
-                &format!(
-                    "ETA: {} ({} images remaining)",
-                    fmt_duration(eta_secs),
-                    fmt_num(remaining)
-                ),
-            );
-        } else if status.completed_tasks == status.total_tasks && status.total_tasks > 0 {
-            pline(w, "✅ ALL TASKS COMPLETED");
-        } else {
-            pline(w, "ETA: calculating…");
-        }
-
-        if t.max_images > 0 {
-            pline(
-                w,
-                &format!("Max images: {} (limited)", fmt_num(t.max_images)),
-            );
-        }
-
-        eprintln!("╟{}╢", dash);
-        pline(w, "Fault Tolerance");
-        pline(
-            w,
-            &format!(
-                "TTL expirations: {:<6}  Assignments: {:<8}  Completions: {}",
-                t.ttl_expirations,
-                fmt_num(t.total_assignments),
-                fmt_num(t.total_completions)
-            ),
-        );
-        pline(
-            w,
-            &format!(
-                "LC crashes: {:<4}  LC restarts: {:<4}  LC replacements: {}",
-                state.lc_crashes, state.lc_restarts, state.lc_replacements
-            ),
-        );
-        pline(
-            w,
-            &format!(
-                "CC crashes: {:<4}  CC restarts: {}",
-                state.cc_crashes, state.cc_restarts
-            ),
-        );
-
-        if !status.stale_nodes.is_empty() {
-            pline(
-                w,
-                &format!("⚠ Stale nodes: {}", status.stale_nodes.join(", ")),
-            );
-        }
-
-        eprintln!("╟{}╢", dash);
-        pline(w, "Per-Node Throughput");
-
-        let max_img = t.per_node_images.iter().map(|(_, c)| *c).max().unwrap_or(1);
-        for (node_id, img_count) in t.per_node_images.iter().take(15) {
-            let bar_width: usize = 20;
-            let filled = if max_img > 0 {
-                ((*img_count as f64 / max_img as f64) * bar_width as f64) as usize
-            } else {
-                0
-            };
-            let empty = bar_width.saturating_sub(filled);
-            let batch_count = t
-                .per_node_completions
-                .iter()
-                .find(|(n, _)| n == node_id)
-                .map(|(_, c)| *c)
-                .unwrap_or(0);
-            let display_id: &str = if node_id.len() > 14 {
-                &node_id[..14]
-            } else {
-                node_id
-            };
-            pline(
-                w,
-                &format!(
-                    "{:<14} [{}{}] {:>8} img {:>5} bat",
-                    display_id,
-                    "█".repeat(filled),
-                    "░".repeat(empty),
-                    fmt_num(*img_count),
-                    fmt_num(batch_count)
-                ),
-            );
-        }
-
-        if t.per_node_images.is_empty() {
-            pline(w, "(no completions yet)");
-        }
-
-        eprintln!("╟{}╢", dash);
-        let total_agents: usize = status.registered_nodes.iter().map(|n| n.agent_count).sum();
-        let active_lcs = status
-            .registered_nodes
-            .iter()
-            .filter(|n| n.agent_count > 0)
-            .count();
-        let replica_lcs = status
-            .registered_nodes
-            .iter()
-            .filter(|n| n.agent_count == 0)
-            .count();
-        pline(
-            w,
-            &format!(
-                "Nodes: {} active LC, {} replica, {} total agents",
-                active_lcs, replica_lcs, total_agents
-            ),
-        );
-    } else {
-        pline(w, "Waiting for cluster status…");
-        pline(w, "(CCs may still be electing a leader)");
-    }
-
-    eprintln!("╚{}╝", line);
-    eprintln!("  Press Ctrl+C to stop watchdog.");
-}
-
-/// Print a padded line inside the box: ║  content...              ║
-fn pline(width: usize, content: &str) {
-    let inner = width - 2; // 2 chars for "  " prefix
-    if content.len() <= inner {
-        eprintln!("║  {:<inner$}║", content, inner = inner);
-    } else {
-        eprintln!("║  {}║", &content[..inner]);
-    }
-}
-
 /// Periodically checks that every LC process is still running.
-///
-/// On first detecting a node as down the watchdog waits `RESTART_DELAY_SECS`
-/// so the CC can complete its two-stage failover before the node comes back
-/// (prevents the CC clearing suspicion prematurely and skipping replica activation).
-///
-/// After `MAX_RESTART_ATTEMPTS` consecutive SSH failures the node is considered
-/// permanently dead. The watchdog then picks a fresh available node, starts an
-/// LC (`--agents 0`) on it, and replaces the dead entry in the watchlist.
 fn lc_watchdog(
     lc_watchlist: Vec<(String, String, String)>,
     cc_watchlist: Vec<(String, String, String)>,
     ctx: WatchdogContext,
+    dashboard: Arc<Mutex<DashboardState>>,
+    log_buf: LogBuffer,
 ) {
     // How often to poll each LC node.
     const INTERVAL_SECS: u64 = 10;
@@ -997,17 +787,6 @@ fn lc_watchdog(
     // CC entries: (node, binary, args) — stored separately, no replacement logic.
     let cc_entries: Vec<(String, String, String)> = cc_watchlist;
 
-    let mut dashboard = DashboardState {
-        lc_crashes: 0,
-        lc_restarts: 0,
-        cc_crashes: 0,
-        cc_restarts: 0,
-        lc_replacements: 0,
-        throughput_history: Vec::new(),
-        last_status: None,
-        start_time: std::time::Instant::now(),
-    };
-
     loop {
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
@@ -1017,30 +796,27 @@ fn lc_watchdog(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            dashboard
-                .throughput_history
-                .push((now, status.completed_tasks));
-            if dashboard.throughput_history.len() > MAX_HISTORY {
-                dashboard.throughput_history.remove(0);
+            let mut d = dashboard.lock().unwrap();
+            d.throughput_history.push((now, status.completed_tasks));
+            if d.throughput_history.len() > MAX_HISTORY {
+                d.throughput_history.remove(0);
             }
-            dashboard.last_status = Some(status);
+            d.last_status = Some(status);
         }
-
-        // --- Render dashboard ---
-        render_dashboard(&dashboard);
 
         // --- CC monitoring: restart on same node, no replacement ---
         for (node, binary, args) in cc_entries.iter() {
             let alive = ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1");
             if !alive {
-                dashboard.cc_crashes += 1;
-                eprintln!("[watchdog] CC on {} not running — restarting…", node);
+                dashboard.lock().unwrap().cc_crashes += 1;
+                log_msg!(log_buf, "[watchdog] CC on {} not running — restarting…", node);
                 let log_file = format!("{}/cc-{}.log", ctx.log_dir, node);
                 if ssh_start(node, binary, args, &log_file) {
-                    dashboard.cc_restarts += 1;
-                    eprintln!("[watchdog] CC on {} restarted ok", node);
+                    dashboard.lock().unwrap().cc_restarts += 1;
+                    log_msg!(log_buf, "[watchdog] CC on {} restarted ok", node);
                 } else {
-                    eprintln!(
+                    log_msg!(
+                        log_buf,
                         "[watchdog] CC on {} restart FAILED — will retry next cycle",
                         node
                     );
@@ -1058,7 +834,7 @@ fn lc_watchdog(
             let alive = ssh_run(&entry.node, "pgrep -f inf3203_aika > /dev/null 2>&1");
             if alive {
                 if entry.down_since.take().is_some() {
-                    eprintln!("[watchdog] LC on {} recovered", entry.node);
+                    log_msg!(log_buf, "[watchdog] LC on {} recovered", entry.node);
                     entry.failed_attempts = 0;
                 }
                 continue;
@@ -1066,13 +842,14 @@ fn lc_watchdog(
 
             // Node is down — record when we first noticed.
             if entry.down_since.is_none() {
-                dashboard.lc_crashes += 1;
+                dashboard.lock().unwrap().lc_crashes += 1;
             }
             let first_down = entry.down_since.get_or_insert_with(std::time::Instant::now);
             let down_secs = first_down.elapsed().as_secs();
 
             if down_secs < RESTART_DELAY_SECS {
-                eprintln!(
+                log_msg!(
+                    log_buf,
                     "[watchdog] LC on {} down {}s — waiting {}s before restart",
                     entry.node, down_secs, RESTART_DELAY_SECS
                 );
@@ -1080,7 +857,8 @@ fn lc_watchdog(
             }
 
             // Delay elapsed — attempt restart.
-            eprintln!(
+            log_msg!(
+                log_buf,
                 "[watchdog] LC on {} down {}s — restarting as replica (attempt {}/{})…",
                 entry.node,
                 down_secs,
@@ -1089,8 +867,8 @@ fn lc_watchdog(
             );
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, entry.node);
             if ssh_start(&entry.node, &ctx.binary, &entry.restart_args, &log_file) {
-                eprintln!("[watchdog] LC on {} restarted ok", entry.node);
-                dashboard.lc_restarts += 1;
+                log_msg!(log_buf, "[watchdog] LC on {} restarted ok", entry.node);
+                dashboard.lock().unwrap().lc_restarts += 1;
                 entry.down_since = None;
                 entry.failed_attempts = 0;
                 continue;
@@ -1098,7 +876,8 @@ fn lc_watchdog(
 
             entry.failed_attempts += 1;
             if entry.failed_attempts < MAX_RESTART_ATTEMPTS {
-                eprintln!(
+                log_msg!(
+                    log_buf,
                     "[watchdog] LC on {} restart failed ({}/{})",
                     entry.node, entry.failed_attempts, MAX_RESTART_ATTEMPTS
                 );
@@ -1106,7 +885,8 @@ fn lc_watchdog(
             }
 
             // Node is confirmed dead — find a replacement.
-            eprintln!(
+            log_msg!(
+                log_buf,
                 "[watchdog] LC on {} permanently unreachable — seeking replacement node",
                 entry.node
             );
@@ -1125,13 +905,14 @@ fn lc_watchdog(
                     })
                     .collect(),
                 Err(e) => {
-                    eprintln!("[watchdog] Could not query available nodes: {}", e);
+                    log_msg!(log_buf, "[watchdog] Could not query available nodes: {}", e);
                     continue;
                 }
             };
 
             let Some(new_node) = candidates.into_iter().next() else {
-                eprintln!(
+                log_msg!(
+                    log_buf,
                     "[watchdog] No replacement node available for {}",
                     entry.node
                 );
@@ -1139,7 +920,7 @@ fn lc_watchdog(
             };
 
             let Some(port) = find_free_port(&new_node, 30) else {
-                eprintln!("[watchdog] No free port on replacement node {}", new_node);
+                log_msg!(log_buf, "[watchdog] No free port on replacement node {}", new_node);
                 continue;
             };
 
@@ -1150,20 +931,21 @@ fn lc_watchdog(
                 node_id, port, ctx.peer_list, ctx.classify_script, IMAGE_DIR, ctx.python
             );
 
-            eprintln!(
+            log_msg!(
+                log_buf,
                 "[watchdog] Starting replacement LC on {} (was {})…",
                 new_node, entry.node
             );
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, new_node);
             if ssh_start(&new_node, &ctx.binary, &new_restart_args, &log_file) {
-                eprintln!("[watchdog] Replacement LC on {} started ok", new_node);
-                dashboard.lc_replacements += 1;
+                log_msg!(log_buf, "[watchdog] Replacement LC on {} started ok", new_node);
+                dashboard.lock().unwrap().lc_replacements += 1;
                 entry.node = new_node;
                 entry.restart_args = new_restart_args;
                 entry.down_since = None;
                 entry.failed_attempts = 0;
             } else {
-                eprintln!("[watchdog] Replacement LC on {} failed to start", new_node);
+                log_msg!(log_buf, "[watchdog] Replacement LC on {} failed to start", new_node);
                 // Reset attempts so we try another replacement next cycle.
                 entry.failed_attempts = 0;
             }
