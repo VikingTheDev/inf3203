@@ -436,8 +436,9 @@ fn main() {
         let node_args = format!(
             "cluster-controller --node-id {} --bind 0.0.0.0:{} --peers {} --image-dir {} \
              --data-dir {} --results-dir {} \
-             --batch-size 50 --task-ttl-secs 600 \
-             --heartbeat-interval-ms 500 --election-timeout-min-ms 2000 --election-timeout-max-ms 5000 \
+             --batch-size 50 --task-ttl-secs 60 \
+             --heartbeat-interval-ms 200 --election-timeout-min-ms 1000 --election-timeout-max-ms 3000 \
+             --lc-heartbeat-timeout-secs 15 \
              --max-images {}",
             node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str, max_images
         );
@@ -564,7 +565,6 @@ fn main() {
             peer_list: peer_list.clone(),
             log_dir: log_dir_str.clone(),
             python: venv_python_str.to_string(),
-            cc_addrs: cc_started.clone(),
         };
 
         let deploy_info = DeployInfo {
@@ -590,12 +590,33 @@ fn main() {
             completed_at: None,
         }));
 
-        // Run watchdog in a background thread; TUI runs on main thread.
-        let watchdog_state = Arc::clone(&dashboard_state);
-        let watchdog_log = log_buf.clone();
-        thread::spawn(move || {
-            lc_watchdog(lc_watchlist, cc_watchlist, ctx, watchdog_state, watchdog_log);
-        });
+        // Run three independent background threads; TUI runs on main thread.
+        //  1. Telemetry poller — polls CC /status every 3s (lightweight curl)
+        //  2. CC monitor — checks CC processes every 10s (SSH per node)
+        //  3. LC monitor — checks LC processes every 10s (SSH per node)
+        {
+            let state = Arc::clone(&dashboard_state);
+            let log = log_buf.clone();
+            let addrs = cc_started.clone();
+            thread::spawn(move || {
+                telemetry_poller(addrs, state, log);
+            });
+        }
+        {
+            let state = Arc::clone(&dashboard_state);
+            let log = log_buf.clone();
+            let log_dir = ctx.log_dir.clone();
+            thread::spawn(move || {
+                cc_monitor(cc_watchlist, log_dir, state, log);
+            });
+        }
+        {
+            let state = Arc::clone(&dashboard_state);
+            let log = log_buf.clone();
+            thread::spawn(move || {
+                lc_monitor(lc_watchlist, ctx, state, log);
+            });
+        }
 
         if let Err(e) = dashboard::run_tui(dashboard_state, deploy_info, log_buf) {
             eprintln!("TUI error: {}", e);
@@ -630,8 +651,6 @@ struct WatchdogContext {
     peer_list: String,
     log_dir: String,
     python: String,
-    /// CC addresses for polling /status (e.g. ["c6-0:50123", "c6-1:50456"]).
-    cc_addrs: Vec<String>,
 }
 
 /// One entry in the watchdog's tracking list.
@@ -760,41 +779,22 @@ fn fmt_num(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-/// Periodically checks that every LC process is still running.
-fn lc_watchdog(
-    lc_watchlist: Vec<(String, String, String)>,
-    cc_watchlist: Vec<(String, String, String)>,
-    ctx: WatchdogContext,
+/// Polls CC /status every few seconds and updates the shared dashboard state.
+/// Lightweight (single curl call), so it runs at a higher frequency than the
+/// SSH-based CC/LC monitors.
+fn telemetry_poller(
+    cc_addrs: Vec<String>,
     dashboard: Arc<Mutex<DashboardState>>,
     log_buf: LogBuffer,
 ) {
-    // How often to poll each LC node.
-    const INTERVAL_SECS: u64 = 10;
-    // Must be > 2 × lc_heartbeat_timeout_secs (default 60s).
-    const RESTART_DELAY_SECS: u64 = 150;
-    // Consecutive SSH failures before we give up and pick a replacement node.
-    const MAX_RESTART_ATTEMPTS: u32 = 3;
+    const POLL_INTERVAL_SECS: u64 = 3;
     // How many throughput history entries to keep (for sliding window calculation).
-    const MAX_HISTORY: usize = 360; // ~1 hour at 10s interval
-
-    let mut lc_entries: Vec<WatchdogEntry> = lc_watchlist
-        .into_iter()
-        .map(|(node, _binary, restart_args)| WatchdogEntry {
-            node,
-            restart_args,
-            failed_attempts: 0,
-            down_since: None,
-        })
-        .collect();
-
-    // CC entries: (node, binary, args) — stored separately, no replacement logic.
-    let cc_entries: Vec<(String, String, String)> = cc_watchlist;
+    const MAX_HISTORY: usize = 1200; // ~1 hour at 3s interval
 
     loop {
-        thread::sleep(Duration::from_secs(INTERVAL_SECS));
+        thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
 
-        // --- Poll cluster status for dashboard ---
-        if let Some(status) = poll_status(&ctx.cc_addrs) {
+        if let Some(status) = poll_status(&cc_addrs) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -818,14 +818,28 @@ fn lc_watchdog(
                 d.last_status = Some(status);
             }
         }
+    }
+}
 
-        // --- CC monitoring: restart on same node, no replacement ---
+/// Monitors CC processes via SSH and restarts them on the same node if crashed.
+/// Runs every 10s. No replacement logic (Raft doesn't support dynamic membership).
+fn cc_monitor(
+    cc_entries: Vec<(String, String, String)>,
+    log_dir: String,
+    dashboard: Arc<Mutex<DashboardState>>,
+    log_buf: LogBuffer,
+) {
+    const INTERVAL_SECS: u64 = 10;
+
+    loop {
+        thread::sleep(Duration::from_secs(INTERVAL_SECS));
+
         for (node, binary, args) in cc_entries.iter() {
             let alive = ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1");
             if !alive {
                 dashboard.lock().unwrap().cc_crashes += 1;
                 log_msg!(log_buf, "[watchdog] CC on {} not running — restarting…", node);
-                let log_file = format!("{}/cc-{}.log", ctx.log_dir, node);
+                let log_file = format!("{}/cc-{}.log", log_dir, node);
                 if ssh_start(node, binary, args, &log_file) {
                     dashboard.lock().unwrap().cc_restarts += 1;
                     log_msg!(log_buf, "[watchdog] CC on {} restarted ok", node);
@@ -838,8 +852,35 @@ fn lc_watchdog(
                 }
             }
         }
+    }
+}
 
-        // --- LC monitoring: restart with delay, replace if permanently dead ---
+/// Monitors LC processes via SSH. Restarts with delay, replaces permanently dead
+/// nodes with fresh available ones.
+fn lc_monitor(
+    lc_watchlist: Vec<(String, String, String)>,
+    ctx: WatchdogContext,
+    dashboard: Arc<Mutex<DashboardState>>,
+    log_buf: LogBuffer,
+) {
+    const INTERVAL_SECS: u64 = 10;
+    // Must be > 2 × lc_heartbeat_timeout_secs (now 15s).
+    const RESTART_DELAY_SECS: u64 = 45;
+    // Consecutive SSH failures before we give up and pick a replacement node.
+    const MAX_RESTART_ATTEMPTS: u32 = 3;
+
+    let mut lc_entries: Vec<WatchdogEntry> = lc_watchlist
+        .into_iter()
+        .map(|(node, _binary, restart_args)| WatchdogEntry {
+            node,
+            restart_args,
+            failed_attempts: 0,
+            down_since: None,
+        })
+        .collect();
+
+    loop {
+        thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
         // Collect nodes currently tracked so we can exclude them when picking replacements.
         let known_nodes: std::collections::HashSet<String> =
