@@ -493,9 +493,20 @@ fn main() {
 
         let mut lc_started = 0usize;
 
+        // Collect launch info for all LCs, start them all without waiting,
+        // then batch-verify after a single 2s pause.
+        struct LcLaunch {
+            node: String,
+            node_id: String,
+            port: u16,
+            label: &'static str,
+            restart_args_template: String,
+            launched: bool,
+        }
+
+        let mut launches: Vec<LcLaunch> = Vec::new();
+
         for (i, node) in lc_nodes.iter().enumerate() {
-            // The first LC is a standby replica with 0 agents; it will be
-            // activated by the CC via POST /activate if another LC fails.
             let is_replica = i == 0;
             let agents = if is_replica { 0 } else { AGENTS_PER_LC };
             let label = if is_replica { "replica" } else { "active " };
@@ -504,6 +515,14 @@ fn main() {
                 Some(p) => p,
                 None => {
                     eprintln!("  No free port on {} — skipping.", node);
+                    launches.push(LcLaunch {
+                        node: node.clone(),
+                        node_id: format!("lc-{}", node),
+                        port: 0,
+                        label,
+                        restart_args_template: String::new(),
+                        launched: false,
+                    });
                     continue;
                 }
             };
@@ -514,9 +533,6 @@ fn main() {
                  --agents {} --extractor-script {} --image-base-path {} --python {}",
                 node_id, port, peer_list, agents, classify_script_str, IMAGE_DIR, venv_python_str
             );
-            // Watchdog always restarts as a standby replica (--agents 0)
-            // to replace the old replica that CC promoted.
-            // Uses {PORT} placeholder — resolved at restart time to a fresh port.
             let restart_args_template = format!(
                 "local-controller --node-id {} --bind 0.0.0.0:{{PORT}} --cc-addrs {} \
                  --agents 0 --extractor-script {} --image-base-path {} --python {}",
@@ -524,12 +540,36 @@ fn main() {
             );
 
             let log_file = format!("{}/lc-{}.log", log_dir_str, node);
-            if ssh_start(node, binary_str, &lc_args, &log_file) {
-                log_msg!(log_buf, "  LC [{}] {} @ {}:{} … ok", label, node_id, node, port);
+            let cmd = format!(
+                "nohup {} {} </dev/null >>{} 2>&1 &",
+                binary_str, lc_args, log_file
+            );
+            let ok = ssh_run(node, &cmd);
+            launches.push(LcLaunch {
+                node: node.clone(),
+                node_id,
+                port,
+                label,
+                restart_args_template,
+                launched: ok,
+            });
+        }
+
+        // Single 2s wait, then verify all in parallel.
+        thread::sleep(Duration::from_secs(2));
+
+        for launch in &launches {
+            if !launch.launched {
+                log_msg!(log_buf, "  LC [{}] {} @ {} … FAILED (no port/ssh)", launch.label, launch.node_id, launch.node);
+                continue;
+            }
+            let alive = ssh_run(&launch.node, "pgrep -f inf3203_aika > /dev/null 2>&1");
+            if alive {
+                log_msg!(log_buf, "  LC [{}] {} @ {}:{} … ok", launch.label, launch.node_id, launch.node, launch.port);
                 lc_started += 1;
-                lc_watchlist.push((node.clone(), node_id, restart_args_template));
+                lc_watchlist.push((launch.node.clone(), launch.node_id.clone(), launch.restart_args_template.clone()));
             } else {
-                log_msg!(log_buf, "  LC [{}] {} @ {}:{} … FAILED", label, node_id, node, port);
+                log_msg!(log_buf, "  LC [{}] {} @ {}:{} … FAILED (not running)", launch.label, launch.node_id, launch.node, launch.port);
             }
         }
 
@@ -692,35 +732,57 @@ struct WatchdogEntry {
 /// Telemetry snapshot received from the CC /status endpoint.
 #[derive(Default, Clone, serde::Deserialize)]
 struct StatusResponse {
+    #[serde(default)]
     total_tasks: u64,
+    #[serde(default)]
     pending_tasks: u64,
+    #[serde(default)]
     assigned_tasks: u64,
+    #[serde(default)]
     completed_tasks: u64,
+    #[serde(default)]
     registered_nodes: Vec<NodeInfoResp>,
+    #[serde(default)]
     stale_nodes: Vec<String>,
+    #[serde(default)]
     telemetry: TelemetryResp,
 }
 
 #[derive(Default, Clone, serde::Deserialize)]
 struct NodeInfoResp {
+    #[serde(default)]
     node_id: String,
+    #[serde(default)]
     agent_count: usize,
 }
 
 #[derive(Default, Clone, serde::Deserialize)]
 struct TelemetryResp {
+    #[serde(default)]
     total_images: u64,
+    #[serde(default)]
     completed_images: u64,
+    #[serde(default)]
     ttl_expirations: u64,
+    #[serde(default)]
     total_assignments: u64,
+    #[serde(default)]
     total_completions: u64,
+    #[serde(default)]
     first_completion_at: Option<u64>,
+    #[serde(default)]
     last_completion_at: Option<u64>,
+    #[serde(default)]
     started_at: Option<u64>,
+    #[serde(default)]
     per_node_completions: Vec<(String, u64)>,
+    #[serde(default)]
     per_node_images: Vec<(String, u64)>,
+    #[serde(default)]
     per_node_ttl_expirations: Vec<(String, u64)>,
+    #[serde(default)]
     batch_size: usize,
+    #[serde(default)]
     max_images: u64,
 }
 
@@ -982,6 +1044,12 @@ fn cc_monitor(
     const INTERVAL_SECS: u64 = 10;
     let mut was_down: Vec<bool> = vec![false; cc_entries.len()];
 
+    log_msg!(
+        log_buf,
+        "[watchdog] CC monitor started — watching {} nodes",
+        cc_entries.len()
+    );
+
     loop {
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
@@ -1026,6 +1094,12 @@ fn lc_monitor(
     const RESTART_DELAY_SECS: u64 = 45;
     // Consecutive SSH failures before we give up and pick a replacement node.
     const MAX_RESTART_ATTEMPTS: u32 = 3;
+
+    log_msg!(
+        log_buf,
+        "[watchdog] LC monitor started — watching {} nodes",
+        lc_watchlist.len()
+    );
 
     let mut lc_entries: Vec<WatchdogEntry> = lc_watchlist
         .into_iter()

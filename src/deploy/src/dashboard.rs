@@ -171,8 +171,8 @@ fn tui_loop(
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             if tui.show_results {
-                                // Already showing — refresh the data.
-                                tui.label_counts = Some(load_results(&deploy_info.results_dir));
+                                // Toggle off.
+                                tui.show_results = false;
                             } else {
                                 tui.show_results = true;
                                 tui.label_counts = Some(load_results(&deploy_info.results_dir));
@@ -831,7 +831,7 @@ fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
         ),
     ];
     if tui.show_results {
-        spans.push(Span::raw(" refresh  "));
+        spans.push(Span::raw(" back  "));
         spans.push(Span::styled(
             "Esc",
             Style::default()
@@ -996,7 +996,8 @@ fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
     std::thread::spawn(move || {
         log_buf.push(format!("⚡ Killing one agent on {}…", hostname));
         // Find the oldest agent process (by PID, lowest = oldest) and kill it.
-        // Agents run as: inf3203_aika agent --agent-id ...
+        // Agents are spawned via current_exe() which resolves the symlink to
+        // the real binary name (aika-node), so match on --agent-id flag instead.
         let result = std::process::Command::new("ssh")
             .args([
                 "-n",
@@ -1008,7 +1009,7 @@ fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
                 "StrictHostKeyChecking=no",
                 &hostname,
             ])
-            .arg("pgrep -f 'inf3203_aika agent' | head -1 | xargs -r kill")
+            .arg("pgrep -f -- '--agent-id' | head -1 | xargs -r kill")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
