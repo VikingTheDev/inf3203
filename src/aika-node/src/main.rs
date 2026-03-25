@@ -75,6 +75,11 @@ enum Role {
         /// Useful for testing with a smaller subset.
         #[arg(long, default_value = "0")]
         max_images: u64,
+
+        /// Hold task ingestion until POST /start is received.
+        /// Allows deployer to wait for all nodes to come up before processing begins.
+        #[arg(long)]
+        hold: bool,
     },
 
     /// Run as a local controller (monitors agents on this physical node)
@@ -176,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
             election_timeout_min_ms,
             election_timeout_max_ms,
             max_images,
+            hold,
         } => {
             let username = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
             let data_dir =
@@ -199,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 election_timeout_min_ms,
                 election_timeout_max_ms,
                 max_images,
+                hold,
             };
             cluster_controller::run(config).await
         }

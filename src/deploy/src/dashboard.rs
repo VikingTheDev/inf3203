@@ -19,6 +19,398 @@ use ratatui::{
 
 use crate::{fmt_duration, fmt_num, DashboardState};
 
+// ── Startup config TUI ──────────────────────────────────────────────────────
+
+/// User-configurable cluster parameters chosen in the startup TUI.
+pub struct StartupConfig {
+    pub num_nodes: usize,
+    pub num_cc: usize,
+    pub num_replicas: usize,
+    pub agents_per_lc: usize,
+    pub max_images: u64,
+    pub task_ttl_secs: u64,
+    pub batch_size: usize,
+}
+
+impl StartupConfig {
+    pub fn new(available_nodes: usize) -> Self {
+        Self {
+            num_nodes: available_nodes.min(10),
+            num_cc: 3,
+            num_replicas: 1,
+            agents_per_lc: 2,
+            max_images: 0,
+            task_ttl_secs: 60,
+            batch_size: 50,
+        }
+    }
+}
+
+/// Field currently selected in the startup form.
+#[derive(Clone, Copy, PartialEq)]
+enum StartupField {
+    NumNodes,
+    NumCC,
+    NumReplicas,
+    AgentsPerLC,
+    MaxImages,
+    TaskTTL,
+    BatchSize,
+}
+
+const STARTUP_FIELDS: [StartupField; 7] = [
+    StartupField::NumNodes,
+    StartupField::NumCC,
+    StartupField::NumReplicas,
+    StartupField::AgentsPerLC,
+    StartupField::MaxImages,
+    StartupField::TaskTTL,
+    StartupField::BatchSize,
+];
+
+/// Show the startup configuration TUI. Returns the config when the user presses Enter.
+/// Returns `None` if the user presses 'q' to quit.
+pub fn run_startup_tui(available_nodes: usize) -> io::Result<Option<StartupConfig>> {
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = startup_loop(&mut terminal, available_nodes);
+
+    disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    result
+}
+
+fn startup_loop(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    available_nodes: usize,
+) -> io::Result<Option<StartupConfig>> {
+    let mut config = StartupConfig::new(available_nodes);
+    let mut selected = 0usize; // index into STARTUP_FIELDS
+
+    loop {
+        let field = STARTUP_FIELDS[selected];
+        terminal.draw(|f| draw_startup(f, &config, field, available_nodes))?;
+
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+                        KeyCode::Char('c')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            return Ok(None);
+                        }
+                        KeyCode::Up => {
+                            selected = if selected == 0 {
+                                STARTUP_FIELDS.len() - 1
+                            } else {
+                                selected - 1
+                            };
+                        }
+                        KeyCode::Down => {
+                            selected = (selected + 1) % STARTUP_FIELDS.len();
+                        }
+                        KeyCode::Left => adjust_field(&mut config, field, false, available_nodes),
+                        KeyCode::Right => adjust_field(&mut config, field, true, available_nodes),
+                        KeyCode::Enter => {
+                            // Validate before accepting.
+                            if config.num_nodes >= config.num_cc
+                                && config.num_cc >= 3
+                                && config.num_nodes <= available_nodes
+                            {
+                                return Ok(Some(config));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn adjust_field(config: &mut StartupConfig, field: StartupField, up: bool, max_nodes: usize) {
+    match field {
+        StartupField::NumNodes => {
+            if up {
+                config.num_nodes = (config.num_nodes + 1).min(max_nodes);
+            } else {
+                config.num_nodes = config.num_nodes.saturating_sub(1).max(config.num_cc);
+            }
+        }
+        StartupField::NumCC => {
+            if up {
+                config.num_cc = (config.num_cc + 2).min(config.num_nodes).min(7); // odd, max 7
+            } else {
+                config.num_cc = config.num_cc.saturating_sub(2).max(3); // odd, min 3
+            }
+        }
+        StartupField::NumReplicas => {
+            let max_replicas = config.num_nodes.saturating_sub(config.num_cc);
+            if up {
+                config.num_replicas = (config.num_replicas + 1).min(max_replicas);
+            } else {
+                config.num_replicas = config.num_replicas.saturating_sub(1);
+            }
+        }
+        StartupField::AgentsPerLC => {
+            if up {
+                config.agents_per_lc = (config.agents_per_lc + 1).min(8);
+            } else {
+                config.agents_per_lc = config.agents_per_lc.saturating_sub(1).max(1);
+            }
+        }
+        StartupField::MaxImages => {
+            if up {
+                config.max_images = config.max_images.saturating_add(10000);
+            } else {
+                config.max_images = config.max_images.saturating_sub(10000);
+            }
+        }
+        StartupField::TaskTTL => {
+            if up {
+                config.task_ttl_secs += 30;
+            } else {
+                config.task_ttl_secs = config.task_ttl_secs.saturating_sub(30).max(30);
+            }
+        }
+        StartupField::BatchSize => {
+            if up {
+                config.batch_size = (config.batch_size + 10).min(500);
+            } else {
+                config.batch_size = config.batch_size.saturating_sub(10).max(10);
+            }
+        }
+    }
+}
+
+fn draw_startup(f: &mut Frame, config: &StartupConfig, selected: StartupField, available: usize) {
+    let area = f.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(14),   // Form
+            Constraint::Length(5), // Summary
+            Constraint::Length(1),  // Footer
+        ])
+        .split(area);
+
+    // Title
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " Áika Cluster — Configuration ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(title, chunks[0]);
+
+    // Form
+    let form_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(" Settings [↑↓ select, ←→ adjust, Enter start, q quit] ");
+    let inner = form_block.inner(chunks[1]);
+    f.render_widget(form_block, chunks[1]);
+
+    let num_lc = config.num_nodes.saturating_sub(config.num_cc);
+    let num_active_lc = num_lc.saturating_sub(config.num_replicas);
+    let total_agents = num_active_lc * config.agents_per_lc;
+    let img_display = if config.max_images == 0 {
+        "all (~1.2M)".to_string()
+    } else {
+        fmt_num(config.max_images)
+    };
+
+    let available_hint = format!("available: {}", available);
+    let agents_hint = format!("→ {} total agents", total_agents);
+
+    let fields: Vec<(&str, String, StartupField, &str)> = vec![
+        (
+            "Total Nodes",
+            format!("{}", config.num_nodes),
+            StartupField::NumNodes,
+            &available_hint,
+        ),
+        (
+            "Cluster Controllers",
+            format!("{}", config.num_cc),
+            StartupField::NumCC,
+            "Raft quorum (odd, 3-7)",
+        ),
+        (
+            "LC Replicas",
+            format!("{}", config.num_replicas),
+            StartupField::NumReplicas,
+            "standby LC nodes (--agents 0)",
+        ),
+        (
+            "Agents per LC",
+            format!("{}", config.agents_per_lc),
+            StartupField::AgentsPerLC,
+            &agents_hint,
+        ),
+        (
+            "Max Images",
+            img_display,
+            StartupField::MaxImages,
+            "0 = unlimited (←→ steps of 10k)",
+        ),
+        (
+            "Task TTL",
+            format!("{}s", config.task_ttl_secs),
+            StartupField::TaskTTL,
+            "seconds before expired tasks reassigned",
+        ),
+        (
+            "Batch Size",
+            format!("{}", config.batch_size),
+            StartupField::BatchSize,
+            "images per task batch",
+        ),
+    ];
+
+    let row_constraints: Vec<Constraint> = fields.iter().map(|_| Constraint::Length(2)).collect();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(inner);
+
+    for (i, (label, value, field, hint)) in fields.iter().enumerate() {
+        let is_selected = *field == selected;
+        let marker = if is_selected { "▸ " } else { "  " };
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let val_style = if is_selected {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+
+        let arrows = if is_selected { " ◂ ▸" } else { "" };
+
+        let line = Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("{:<22}", label), style),
+            Span::styled(format!("{:>10}", value), val_style),
+            Span::styled(arrows, Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {}", hint), Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), rows[i]);
+    }
+
+    // Summary
+    let summary_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" Cluster Summary ");
+    let summary_inner = summary_block.inner(chunks[2]);
+    f.render_widget(summary_block, chunks[2]);
+
+    let valid = config.num_nodes >= config.num_cc
+        && config.num_cc >= 3
+        && config.num_nodes <= available;
+
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} CC nodes  +  {} LC ({} active, {} replica)  =  {} total",
+                    config.num_cc, num_lc, num_active_lc, config.num_replicas, config.num_nodes
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} agents × {} img/batch  |  TTL {}s  |  Images: {}",
+                    total_agents,
+                    config.batch_size,
+                    config.task_ttl_secs,
+                    if config.max_images == 0 {
+                        "all".to_string()
+                    } else {
+                        fmt_num(config.max_images)
+                    },
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        if valid {
+            Line::from(Span::styled(
+                " ✓ Ready — press Enter to deploy",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(Span::styled(
+                " ✗ Invalid config — need ≥3 CC, nodes ≥ CC, nodes ≤ available",
+                Style::default().fg(Color::Red),
+            ))
+        },
+    ];
+    f.render_widget(Paragraph::new(summary_lines), summary_inner);
+
+    // Footer
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " q",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" quit  "),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" select  "),
+        Span::styled(
+            "←→",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" adjust  "),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" deploy"),
+    ]));
+    f.render_widget(footer, chunks[3]);
+}
+
+// ── Monitoring TUI ──────────────────────────────────────────────────────────
+
 /// Deploy info displayed in the header area.
 pub struct DeployInfo {
     pub binary: String,
@@ -40,6 +432,7 @@ struct TuiState {
     selected_node: usize,
     show_results: bool,
     label_counts: Option<Vec<(String, u64)>>,
+    cluster_started: bool,
 }
 
 /// Thread-safe log buffer that captures messages for the TUI.
@@ -77,16 +470,6 @@ impl LogBuffer {
 }
 
 /// A macro-friendly logging function that appends to the buffer and also prints
-/// to stderr so messages are visible on the terminal before the TUI starts.
-#[macro_export]
-macro_rules! log_msg {
-    ($buf:expr, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        eprintln!("{}", &msg);
-        $buf.push(msg);
-    }};
-}
-
 /// Run the interactive TUI dashboard. Blocks until the user presses 'q' or Ctrl+C.
 /// `state` and `log_buf` are polled each tick for updates.
 pub fn run_tui(
@@ -117,6 +500,7 @@ fn tui_loop(
         selected_node: 0,
         show_results: false,
         label_counts: None,
+        cluster_started: false,
     };
     let total_nodes = deploy_info.cc_nodes.len() + deploy_info.lc_nodes.len();
 
@@ -176,6 +560,12 @@ fn tui_loop(
                             } else {
                                 tui.show_results = true;
                                 tui.label_counts = Some(load_results(&deploy_info.results_dir));
+                            }
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            if !tui.cluster_started {
+                                send_start_signal(&deploy_info.cc_addrs, log_buf);
+                                tui.cluster_started = true;
                             }
                         }
                         KeyCode::Esc => {
@@ -802,6 +1192,17 @@ fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" quit  "),
+    ];
+    if !tui.cluster_started {
+        spans.push(Span::styled(
+            "s",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" START  "));
+    }
+    spans.extend([
         Span::styled(
             "↑↓",
             Style::default()
@@ -829,7 +1230,7 @@ fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
     if tui.show_results {
         spans.push(Span::raw(" back  "));
         spans.push(Span::styled(
@@ -951,6 +1352,35 @@ fn node_hostname(info: &DeployInfo, index: usize) -> String {
     }
 }
 
+/// Send POST /start to all CC addresses to unhold the cluster.
+fn send_start_signal(cc_addrs: &[String], log_buf: &LogBuffer) {
+    let addrs: Vec<String> = cc_addrs.to_vec();
+    let log_buf = log_buf.clone();
+    std::thread::spawn(move || {
+        log_buf.push(format!("🚀 Sending start signal to {} CCs…", addrs.len()));
+        for addr in &addrs {
+            let url = format!("http://{}/start", addr);
+            let result = std::process::Command::new("curl")
+                .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", &url])
+                .output();
+            match result {
+                Ok(out) => {
+                    let code = String::from_utf8_lossy(&out.stdout);
+                    if code.starts_with('2') {
+                        log_buf.push(format!("  ✓ {} started (HTTP {})", addr, code.trim()));
+                    } else {
+                        log_buf.push(format!("  ✗ {} — HTTP {}", addr, code.trim()));
+                    }
+                }
+                Err(e) => {
+                    log_buf.push(format!("  ✗ {} — {}", addr, e));
+                }
+            }
+        }
+        log_buf.push(format!("Start signal sent."));
+    });
+}
+
 /// Kill all aika processes on a node via SSH (runs in background thread).
 fn kill_node(hostname: &str, log_buf: &LogBuffer) {
     let hostname = hostname.to_string();
@@ -968,7 +1398,7 @@ fn kill_node(hostname: &str, log_buf: &LogBuffer) {
                 "StrictHostKeyChecking=no",
                 &hostname,
             ])
-            .arg("pkill -f '[i]nf3203_aika'; pkill -f -- '--agent-id'; true")
+            .arg("pkill -f '[i]nf3203_aika'; pkill -f '[-]-agent-id'; true")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1013,7 +1443,7 @@ fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
                 "StrictHostKeyChecking=no",
                 &hostname,
             ])
-            .arg("pgrep -f -- '--agent-id' | head -1 | xargs -r kill")
+            .arg("pgrep -f '[-]-agent-id' | head -1 | xargs -r kill")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1064,7 +1494,7 @@ fn count_agents_on(hostname: &str) -> u32 {
             "-o", "StrictHostKeyChecking=no",
             hostname,
         ])
-        .arg("pgrep -fc -- '--agent-id' || true")
+        .arg("pgrep -fc '[-]-agent-id' || true")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();

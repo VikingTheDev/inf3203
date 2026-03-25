@@ -9,6 +9,7 @@ use axum::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
@@ -38,6 +39,8 @@ pub struct ClusterControllerConfig {
     pub election_timeout_max_ms: u64,
     /// Maximum number of images to process (0 = unlimited).
     pub max_images: u64,
+    /// If true, hold task ingestion until POST /start is received.
+    pub hold: bool,
 }
 
 // endregion
@@ -327,6 +330,8 @@ struct AppState {
     node_id: u64,
     /// Directory for writing the results NDJSON file.
     results_dir: String,
+    /// When `--hold` is set, this is false until POST /start is called.
+    started: Arc<AtomicBool>,
 }
 
 // endregion
@@ -386,6 +391,7 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
         lc_timeout_secs,
         node_id,
         results_dir,
+        started: Arc::new(AtomicBool::new(!config.hold)),
     };
 
     // TTL reaper — only the leader acts, followers idle.
@@ -399,6 +405,7 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
     // Leadership watcher — resumes/completes image ingestion on every election win.
     // Ingestion may have been partial if the previous leader crashed mid-way;
     // `ingest_image_tasks` uses `next_batch_id` to skip already-committed batches.
+    // When `--hold` is set, waits for POST /start before beginning ingestion.
     {
         let ingest_app = app.clone();
         tokio::spawn(async move {
@@ -406,6 +413,12 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
             let mut ingestion_complete = false;
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Wait for the start signal if --hold was set.
+                if !ingest_app.started.load(Ordering::Relaxed) {
+                    continue;
+                }
+
                 let is_leader = ingest_app.raft.is_leader();
                 if !is_leader {
                     was_leader = false;
@@ -452,6 +465,8 @@ async fn start_http_server(app: AppState, bind: SocketAddr) -> anyhow::Result<()
         .route("/heartbeat", post(handle_heartbeat))
         .route("/leader", get(handle_leader_query))
         .route("/status", get(handle_status))
+        // Cluster lifecycle
+        .route("/start", post(handle_start))
         // Raft internal endpoints (CC-to-CC only)
         .route("/raft/request_vote", post(handle_raft_request_vote))
         .route("/raft/append_entries", post(handle_raft_append_entries))
@@ -586,6 +601,16 @@ async fn handle_heartbeat(
     }
 
     Ok(Json(HeartbeatResponse { acknowledged: true }))
+}
+
+/// POST /start — release the hold on task ingestion.
+/// Safe to call multiple times; idempotent.
+async fn handle_start(State(app): State<AppState>) -> StatusCode {
+    let was_started = app.started.swap(true, Ordering::Relaxed);
+    if !was_started {
+        tracing::info!("Cluster start signal received — beginning task ingestion");
+    }
+    StatusCode::OK
 }
 
 /// GET /leader — return the current Raft leader's address.
