@@ -292,37 +292,20 @@ fn ensure_binary(install_dir: &Path, log_buf: &LogBuffer) -> PathBuf {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <num_nodes> [max_images]", args[0]);
-        eprintln!("       {} cleanup", args[0]);
-        eprintln!("       {} merge", args[0]);
-        eprintln!();
-        eprintln!("  Deploys an Áika cluster. Run from a shared-filesystem directory");
-        eprintln!("  (e.g. your NFS cwd) so all nodes can reach the binary.");
-        eprintln!(
-            "  Minimum: {} nodes (one Raft quorum). Recommended: 10+.",
-            NUM_CC
-        );
-        eprintln!();
-        eprintln!("  max_images  Optional: limit the total number of images to process.");
-        eprintln!("              Default: 0 (unlimited — process all images).");
-        eprintln!();
-        eprintln!("  cleanup  Remove Raft state dirs on all previously-deployed nodes.");
-        eprintln!("  merge    Deduplicate results_*.ndjson into results_final.ndjson.");
-        std::process::exit(1);
-    }
 
-    let cwd: PathBuf = env::current_dir().expect("cannot determine current directory");
-
-    if args[1] == "cleanup" {
+    if args.len() >= 2 && args[1] == "cleanup" {
+        let cwd: PathBuf = env::current_dir().expect("cannot determine current directory");
         run_cleanup(&cwd);
         return;
     }
 
-    if args[1] == "merge" {
+    if args.len() >= 2 && args[1] == "merge" {
+        let cwd: PathBuf = env::current_dir().expect("cannot determine current directory");
         merge_results(&cwd);
         return;
     }
+
+    let cwd: PathBuf = env::current_dir().expect("cannot determine current directory");
 
     let num_nodes: usize;
     let max_images: u64;
@@ -354,7 +337,7 @@ fn main() {
     }
 
     // --- Configuration: startup TUI or CLI args ---
-    if args.len() >= 2 && args[1] != "0" {
+    if args.len() >= 2 {
         // Legacy CLI mode: deploy <num_nodes> [max_images]
         num_nodes = args[1].parse().expect("num_nodes must be a positive integer");
         max_images = if args.len() > 2 { args[2].parse().unwrap_or(0) } else { 0 };
@@ -851,25 +834,42 @@ fn save_telemetry(state: &DashboardState, path: &str) {
 
 /// Poll one of the CC addresses for the /status endpoint.
 fn poll_status(cc_addrs: &[String]) -> Option<StatusResponse> {
+    // Try to find the leader first — only the leader has heartbeat data
+    // (registered_nodes, per-node stats). Polling a follower gives stale node info.
+    let mut leader_addr: Option<String> = None;
     for addr in cc_addrs {
-        let url = format!("http://{}/status", addr);
-        // Use a simple blocking HTTP GET via std (deploy is a sync binary).
-        match std::net::TcpStream::connect_timeout(
-            &addr.parse().unwrap_or_else(|_| {
-                // addr may be hostname:port, need to resolve
-                use std::net::ToSocketAddrs;
-                addr.to_socket_addrs()
-                    .ok()
-                    .and_then(|mut i| i.next())
-                    .unwrap_or_else(|| "127.0.0.1:80".parse().unwrap())
-            }),
-            Duration::from_secs(3),
-        ) {
-            Ok(_) => {} // connection works, now do HTTP
-            Err(_) => continue,
+        let output = Command::new("curl")
+            .args(["-s", "--connect-timeout", "2", "--max-time", "3"])
+            .arg(format!("http://{}/leader", addr))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(resp) = serde_json::from_slice::<LeaderResponse>(&out.stdout) {
+                    if let Some(la) = resp.leader_address {
+                        leader_addr = Some(la);
+                        break;
+                    }
+                }
+            }
         }
+    }
 
-        // Use a simple approach: shell out to curl
+    // Build the list of addresses to try: leader first, then all others as fallback.
+    let mut addrs_to_try: Vec<&str> = Vec::new();
+    if let Some(ref la) = leader_addr {
+        addrs_to_try.push(la.as_str());
+    }
+    for addr in cc_addrs {
+        if leader_addr.as_deref() != Some(addr.as_str()) {
+            addrs_to_try.push(addr.as_str());
+        }
+    }
+
+    for addr in addrs_to_try {
+        let url = format!("http://{}/status", addr);
+
         let output = Command::new("curl")
             .args(["-s", "--connect-timeout", "3", "--max-time", "5"])
             .arg(&url)
