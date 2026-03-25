@@ -753,23 +753,29 @@ async fn lc_monitor_loop(app: AppState) {
 /// Only newly completed batches since the last flush are appended, so the file
 /// grows incrementally and a crash only loses the current flush interval's data.
 ///
+/// Once every task is completed, writes a final `labeled_data.json` that groups
+/// images by label.
+///
 /// Runs only on the leader (the node with the authoritative state machine).
 /// File path: `<results_dir>/results_<node_id>.ndjson`
 async fn results_flush_loop(app: AppState) {
     let path = format!("{}/results_{}.ndjson", app.results_dir, app.node_id);
     let mut flushed: HashSet<u64> = HashSet::new();
+    let mut final_written = false;
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
 
         if !app.raft.is_leader() {
+            final_written = false;
             continue;
         }
 
         // Collect newly completed batches — brief lock, no I/O.
-        let new_completed: Vec<(u64, Vec<(String, String)>)> = {
+        let (new_completed, all_done, total) = {
             let sm = app.sm.lock().expect("sm lock");
-            sm.tasks
+            let new: Vec<(u64, Vec<(String, String)>)> = sm
+                .tasks
                 .values()
                 .filter(|b| b.status == TaskStatus::Completed && !flushed.contains(&b.batch_id))
                 .map(|b| {
@@ -780,51 +786,130 @@ async fn results_flush_loop(app: AppState) {
                         .collect();
                     (b.batch_id, labels)
                 })
-                .collect()
+                .collect();
+            let total = sm.tasks.len();
+            let completed = sm.tasks.values().filter(|b| b.status == TaskStatus::Completed).count();
+            (new, total > 0 && completed == total, total)
         };
 
-        if new_completed.is_empty() {
-            continue;
-        }
-
-        // Append new records to the output file (no locks held).
-        match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            Ok(mut file) => {
-                let mut written = 0usize;
-                for (batch_id, labels) in &new_completed {
-                    let record = serde_json::json!({
-                        "batch_id": batch_id,
-                        "labels": labels,
-                    });
-                    let line = format!("{}\n", record);
-                    match file.write_all(line.as_bytes()).await {
-                        Ok(()) => {
-                            flushed.insert(*batch_id);
-                            written += 1;
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to write results to {}: {}", path, e);
-                            break;
+        if !new_completed.is_empty() {
+            // Append new records to the output file (no locks held).
+            match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+            {
+                Ok(mut file) => {
+                    let mut written = 0usize;
+                    for (batch_id, labels) in &new_completed {
+                        let record = serde_json::json!({
+                            "batch_id": batch_id,
+                            "labels": labels,
+                        });
+                        let line = format!("{}\n", record);
+                        match file.write_all(line.as_bytes()).await {
+                            Ok(()) => {
+                                flushed.insert(*batch_id);
+                                written += 1;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to write results to {}: {}", path, e);
+                                break;
+                            }
                         }
                     }
+                    if written > 0 {
+                        tracing::info!(
+                            "Flushed {} completed batches to {} ({} total flushed)",
+                            written,
+                            path,
+                            flushed.len()
+                        );
+                    }
                 }
-                if written > 0 {
-                    tracing::info!(
-                        "Flushed {} completed batches to {} ({} total flushed)",
-                        written,
-                        path,
-                        flushed.len()
-                    );
-                }
+                Err(e) => tracing::error!("Cannot open results file {}: {}", path, e),
             }
-            Err(e) => tracing::error!("Cannot open results file {}: {}", path, e),
+        }
+
+        // Once every task is done, write the final labeled_data.json.
+        if all_done && !final_written {
+            tracing::info!(
+                "All {} tasks completed — writing labeled_data.json",
+                total
+            );
+            write_labeled_data_json(&app).await;
+            final_written = true;
         }
     }
+}
+
+/// Build and write `labeled_data.json`
+///
+/// Groups all images by their predicted label:
+/// ```json
+/// {Mo
+///   "Yellow parrots": ["img001.jpg", "img042.jpg"],
+///   "Greyhound(dog)": ["img003.jpg", "img017.jpg"]
+/// }
+/// ```
+async fn write_labeled_data_json(app: &AppState) {
+    // Collect all labels from the state machine (brief lock, no I/O).
+    let label_map: HashMap<String, Vec<String>> = {
+        let sm = app.sm.lock().expect("sm lock");
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for batch in sm.tasks.values() {
+            for (image_path, label) in &batch.labels {
+                map.entry(label.clone()).or_default().push(image_path.clone());
+            }
+        }
+        map
+    };
+
+    // Sort images within each label for deterministic output.
+    let mut sorted_map: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (label, mut images) in label_map {
+        images.sort_unstable();
+        sorted_map.insert(label, images);
+    }
+
+    let output_path = format!("{}/labeled_data.json", app.results_dir);
+    let tmp_path = format!("{}/labeled_data.json.tmp", app.results_dir);
+
+    match tokio::fs::File::create(&tmp_path).await {
+        Ok(mut file) => {
+            let json = match serde_json::to_string_pretty(&sorted_map) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!("Failed to serialize labeled_data.json: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = file.write_all(json.as_bytes()).await {
+                tracing::error!("Failed to write labeled_data.json: {}", e);
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::error!("Cannot create {}: {}", tmp_path, e);
+            return;
+        }
+    }
+
+    if let Err(e) = tokio::fs::rename(&tmp_path, &output_path).await {
+        tracing::error!("Failed to rename {} -> {}: {}", tmp_path, output_path, e);
+        return;
+    }
+
+    let label_count = sorted_map.len();
+    let image_count: usize = sorted_map.values().map(|v| v.len()).sum();
+    tracing::info!(
+        "Wrote {} ({} labels, {} images)",
+        output_path,
+        label_count,
+        image_count
+    );
 }
 
 // endregion
