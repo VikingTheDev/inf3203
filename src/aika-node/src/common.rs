@@ -204,4 +204,13 @@ pub struct ActivateResponse {
     pub message: String,
 }
 
+/// Cluster controller -> Active LC: instruct it to kill its agents and become a standby replica.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeactivateRequest {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeactivateResponse {
+    pub deactivated: bool,
+}
+
 // endregion

@@ -987,18 +987,18 @@ async fn lc_monitor_loop(app: AppState) {
             }
         }
 
-        // Rebalancing: if target_active_lc_count is configured and we have fewer
-        // active LCs than desired (e.g. after mass crash/restart), promote an idle
-        // replica to restore throughput.
-        if app.target_active_lc_count > 0 {
+        // Rebalancing: only after the start signal has been received.
+        // Before /start, LCs may still be connecting, so active_count is
+        // unreliable — premature promotions lead to active_count > target.
+        if app.target_active_lc_count > 0 && app.started.load(Ordering::Relaxed) {
             let active_count = nodes
                 .iter()
                 .filter(|n| n.agent_count > 0 && now.saturating_sub(n.last_heartbeat) < timeout)
                 .count();
 
             if active_count < app.target_active_lc_count {
+                // Promote an idle replica to restore throughput.
                 let promote_agents = app.agents_per_lc.max(1);
-                // Find a healthy idle replica not already delegated.
                 let replica = nodes.iter().find(|n| {
                     n.agent_count == 0
                         && now.saturating_sub(n.last_heartbeat) < timeout
@@ -1029,6 +1029,36 @@ async fn lc_monitor_loop(app: AppState) {
                         Err(e) => tracing::warn!(
                             "Rebalance activation of {} failed: {}",
                             replica.node_id, e
+                        ),
+                    }
+                }
+            } else if active_count > app.target_active_lc_count {
+                // Demote an excess active LC back to replica.
+                // This happens when more LCs become active than the target (e.g. a
+                // previously-dead LC recovers while a promoted replica is still running).
+                let excess = nodes.iter().find(|n| {
+                    n.agent_count > 0
+                        && now.saturating_sub(n.last_heartbeat) < timeout
+                        && !already_delegated.contains(&n.node_id)
+                });
+                if let Some(excess_lc) = excess {
+                    tracing::info!(
+                        "Rebalancing: active={} > target={} — demoting LC {} to replica",
+                        active_count, app.target_active_lc_count, excess_lc.node_id
+                    );
+                    already_delegated.insert(excess_lc.node_id.clone());
+                    let url = format!("http://{}/deactivate", excess_lc.address);
+                    match client.post(&url).json(&DeactivateRequest {}).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            tracing::info!("LC {} demoted to replica", excess_lc.node_id);
+                        }
+                        Ok(resp) => tracing::warn!(
+                            "Deactivation of {} returned status {}",
+                            excess_lc.node_id, resp.status()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Deactivation of {} failed: {}",
+                            excess_lc.node_id, e
                         ),
                     }
                 }

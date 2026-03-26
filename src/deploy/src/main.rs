@@ -566,9 +566,8 @@ fn run_deploy(
     // start Cluster Controllers
     log_buf.push(format!("[2/3] Starting {} cluster controllers…", num_cc));
     let mut cc_started: Vec<String> = Vec::new();
-    // (node, binary, args, data_dir) — used by the watchdog to restart crashed CCs.
-    // data_dir is stored so the watchdog can wipe stale Raft state before restarting.
-    let mut cc_watchlist: Vec<(String, String, String, String)> = Vec::new();
+    // (node, binary, args) — used by the watchdog to restart crashed CCs.
+    let mut cc_watchlist: Vec<(String, String, String)> = Vec::new();
 
     for (i, (node, port)) in cc_assignments.iter().enumerate() {
         let node_id = i + 1;
@@ -598,7 +597,7 @@ fn run_deploy(
         if ssh_run(node, &cmd) {
             log_buf.push(format!("  CC{} @ {}:{} … ok", node_id, node, port));
             cc_started.push(format!("{}:{}", node, port));
-            cc_watchlist.push((node.clone(), binary_str.to_string(), node_args, data_dir));
+            cc_watchlist.push((node.clone(), binary_str.to_string(), node_args));
         } else {
             log_buf.push(format!("  CC{} @ {}:{} … FAILED", node_id, node, port));
         }
@@ -1268,22 +1267,27 @@ fn telemetry_poller(
                 .as_secs();
             let mut d = dashboard.lock().unwrap();
             d.cc_statuses = statuses;
-            d.throughput_history.push((now, status.completed_tasks));
-            if d.throughput_history.len() > MAX_HISTORY {
-                d.throughput_history.remove(0);
-            }
-            // Record per-node image history for rate calculation.
-            for (node_id, img_count) in &status.telemetry.per_node_images {
-                let history = d.per_node_history.entry(node_id.clone()).or_default();
-                history.push((now, *img_count));
-                if history.len() > MAX_HISTORY {
-                    history.remove(0);
+            // Only record history while the run is active (start pressed, not yet complete).
+            // This keeps avg throughput bounded to the processing window and freezes
+            // displayed values at their final reading once all tasks are done.
+            if d.start_time.is_some() && d.completed_at.is_none() {
+                d.throughput_history.push((now, status.completed_tasks));
+                if d.throughput_history.len() > MAX_HISTORY {
+                    d.throughput_history.remove(0);
                 }
-            }
-            // Record TTL expiration history.
-            d.ttl_history.push((now, status.telemetry.ttl_expirations));
-            if d.ttl_history.len() > MAX_HISTORY {
-                d.ttl_history.remove(0);
+                // Record per-node image history for rate calculation.
+                for (node_id, img_count) in &status.telemetry.per_node_images {
+                    let history = d.per_node_history.entry(node_id.clone()).or_default();
+                    history.push((now, *img_count));
+                    if history.len() > MAX_HISTORY {
+                        history.remove(0);
+                    }
+                }
+                // Record TTL expiration history.
+                d.ttl_history.push((now, status.telemetry.ttl_expirations));
+                if d.ttl_history.len() > MAX_HISTORY {
+                    d.ttl_history.remove(0);
+                }
             }
             // Freeze the timer when all tasks are completed.
             if d.completed_at.is_none()
@@ -1314,7 +1318,7 @@ fn telemetry_poller(
 /// Monitors CC processes via SSH and restarts them on the same node if crashed.
 /// Runs every 10s. No replacement logic (Raft doesn't support dynamic membership).
 fn cc_monitor(
-    cc_entries: Vec<(String, String, String, String)>,
+    cc_entries: Vec<(String, String, String)>,
     log_dir: String,
     dashboard: Arc<Mutex<DashboardState>>,
     log_buf: LogBuffer,
@@ -1330,7 +1334,7 @@ fn cc_monitor(
     loop {
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
-        for (i, (node, binary, args, data_dir)) in cc_entries.iter().enumerate() {
+        for (i, (node, binary, args)) in cc_entries.iter().enumerate() {
             let alive = ssh_run(node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1");
             if alive {
                 was_down[i] = false;
@@ -1344,10 +1348,9 @@ fn cc_monitor(
                 d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_crash", node: node.clone() });
             }
             log_buf.push(format!("[watchdog] CC on {} not running — restarting…", node));
-            // Wipe stale Raft state so the restarted CC rejoins with a clean log
-            // and replicates from the current leader instead of replaying a
-            // possibly-corrupt on-disk log.
-            ssh_run(node, &format!("rm -rf {}/raft", data_dir));
+            // No Raft state wipe: storage.rs gracefully truncates any corrupt final
+            // log line, so the CC restarts with its last known term intact and only
+            // needs to catch up on the last few entries from the leader.
             let log_file = format!("{}/cc-{}.log", log_dir, node);
             if ssh_start(node, binary, args, &log_file) {
                 let mut d = dashboard.lock().unwrap();

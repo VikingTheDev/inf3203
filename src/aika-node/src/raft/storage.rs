@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::log::LogEntry;
 use super::state::PersistentState;
@@ -114,7 +115,19 @@ impl RaftStorage {
                 if line.trim().is_empty() {
                     continue;
                 }
-                entries.push(serde_json::from_str(&line)?);
+                match serde_json::from_str(&line) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        // A truncated or corrupt final line is expected when the
+                        // process was killed mid-write. Stop reading at the first
+                        // bad line; the leader will resend any missing entries.
+                        warn!(
+                            "Truncated log entry (stopping load here, leader will resend): {}",
+                            e
+                        );
+                        break;
+                    }
+                }
             }
             return Ok(entries);
         }

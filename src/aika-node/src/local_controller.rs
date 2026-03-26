@@ -494,6 +494,7 @@ async fn start_http_server(app: AppState, bind: SocketAddr) -> anyhow::Result<()
         .route("/agent/request_task", post(handle_agent_task_request))
         .route("/agent/complete", post(handle_agent_task_complete))
         .route("/activate", post(handle_activate))
+        .route("/deactivate", post(handle_deactivate))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -574,6 +575,34 @@ async fn handle_activate(
         activated: true,
         message: format!("spawned {} agents", count),
     })
+}
+
+/// POST /deactivate — CC instructs this active LC to kill all agents and revert to standby replica.
+///
+/// Idempotent: if already a replica (agent_count == 0), returns `deactivated: false`.
+async fn handle_deactivate(
+    State(app): State<AppState>,
+    Json(_req): Json<DeactivateRequest>,
+) -> Json<DeactivateResponse> {
+    let mut g = app.state.lock().await;
+
+    if !g.is_active {
+        return Json(DeactivateResponse { deactivated: false });
+    }
+
+    tracing::info!("Deactivating — killing {} agents and reverting to replica", g.agents.len());
+
+    // Kill all managed agent processes.
+    for (id, agent) in g.agents.iter_mut() {
+        if let Err(e) = agent.process.kill() {
+            tracing::warn!("Failed to kill agent {}: {}", id, e);
+        }
+    }
+    g.agents.clear();
+    g.config.agent_count = 0;
+    g.is_active = false;
+
+    Json(DeactivateResponse { deactivated: true })
 }
 
 /// POST /agent/heartbeat — agent reports it is alive.
