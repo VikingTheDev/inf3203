@@ -139,24 +139,27 @@ impl RaftNode {
         ));
 
         let peer_node_ids: Vec<NodeId> = peers.clone();
-        let raft_state = Arc::new(Mutex::new(RaftState::new(own_node_id, peer_node_ids)));
-        let raft_log: Arc<Mutex<RaftLog<Command>>> = Arc::new(Mutex::new(RaftLog::new()));
-
         let storage = Arc::new(RaftStorage::new(data_dir).expect("failed to open raft storage"));
 
-        // Restore persisted state (term, votedFor) if this node has run before.
+        // Restore persisted state (term, votedFor) before wrapping in Arc<Mutex> so
+        // we never need to call blocking_lock() from within an async runtime.
+        let mut initial_state = RaftState::new(own_node_id, peer_node_ids);
         if let Some(ps) = storage
             .load_persistent_state()
             .expect("failed to load persistent state")
         {
-            raft_state.blocking_lock().persistent = ps;
+            initial_state.persistent = ps;
         }
+        let raft_state = Arc::new(Mutex::new(initial_state));
 
         // Restore the replicated log from disk.
         let entries = storage.load_log::<Command>().expect("failed to load log");
-        if !entries.is_empty() {
-            *raft_log.blocking_lock() = RaftLog::from_entries(entries);
-        }
+        let initial_log = if entries.is_empty() {
+            RaftLog::new()
+        } else {
+            RaftLog::from_entries(entries)
+        };
+        let raft_log: Arc<Mutex<RaftLog<Command>>> = Arc::new(Mutex::new(initial_log));
 
         // --- Channel setup ---------------------------------------------------
         // propose_rx must be moved into the event loop (Receiver is not Clone).
