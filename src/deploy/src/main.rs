@@ -1348,9 +1348,9 @@ fn cc_monitor(
                 d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_crash", node: node.clone() });
             }
             log_buf.push(format!("[watchdog] CC on {} not running — restarting…", node));
-            // No Raft state wipe: storage.rs gracefully truncates any corrupt final
-            // log line, so the CC restarts with its last known term intact and only
-            // needs to catch up on the last few entries from the leader.
+            // Persistent Raft state (term, voted_for, log) is left intact.
+            // The CC rejoins with its last known term and log; the leader sends
+            // only the missing tail entries to catch it up.
             let log_file = format!("{}/cc-{}.log", log_dir, node);
             if ssh_start(node, binary, args, &log_file) {
                 let mut d = dashboard.lock().unwrap();

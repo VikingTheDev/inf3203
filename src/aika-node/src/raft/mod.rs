@@ -446,9 +446,12 @@ impl RaftNode {
         }
 
         // 2. Step down if the candidate has a higher term.
-        if args.term > current_term {
+        let stepped_down = if args.term > current_term {
             state_guard.step_down_to_follower(&self.storage, args.term);
-        }
+            true
+        } else {
+            false
+        };
 
         let current_term = state_guard.persistent.current_term;
 
@@ -471,12 +474,25 @@ impl RaftNode {
             // 5. Reset election timer so we don't trigger a spurious election
             //    immediately after granting a vote (Raft §5.2).
             drop(state_guard);
+            drop(log_guard);
             self.timer.reset();
 
             return rpc::RequestVoteReply {
                 term: current_term,
                 vote_granted: true,
             };
+        }
+
+        // Deny the vote. If we stepped down due to a higher term, reset the
+        // election timer anyway — we've seen evidence of a live election and
+        // should give the winner time to send a heartbeat before we fire our
+        // own election. Without this, a node that steps down but denies
+        // immediately re-fires its own election, ping-ponging with the
+        // candidate indefinitely.
+        drop(state_guard);
+        drop(log_guard);
+        if stepped_down {
+            self.timer.reset();
         }
 
         rpc::RequestVoteReply {
