@@ -156,12 +156,24 @@ impl RaftNode {
         let entries = storage.load_log::<Command>().expect("failed to load log");
 
         // If a previous crash left a corrupt last line, load_log stops reading
-        // there and returns only the valid prefix. But the corrupt line stays in the
-        // file — future append_log_entries calls would append *after* it, causing
-        // every subsequent restart to lose the same entries again.
+        // there and returns only the valid prefix. But the corrupt line stays in
+        // the file — future append_log_entries calls would append *after* it,
+        // causing every subsequent restart to lose the same entries again.
+        // Fix: rewrite the file to exactly what we loaded.
         //
-        // Fix: rewrite the file to exactly what we loaded. This removes any corrupt
-        // trailing data so appends always go to the right place.
+        // Additionally, if the loaded entries don't start at index 1 (which can
+        // happen due to log corruption during rapid leader bouncing), discard the
+        // entire log and let the leader resend from scratch. This is always safe:
+        // any entries we discard were either uncommitted or will be re-replicated.
+        let entries = if entries.first().map_or(false, |e| e.index != 1) {
+            tracing::warn!(
+                "log starts at index {} instead of 1 — discarding and relying on leader resend",
+                entries[0].index
+            );
+            Vec::new()
+        } else {
+            entries
+        };
         if let Err(e) = storage.save_log(&entries) {
             tracing::warn!("Could not rewrite log file after load: {}", e);
         }
