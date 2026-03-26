@@ -133,6 +133,12 @@ enum Role {
         /// Prevents CPU oversubscription when PyTorch uses OpenMP.
         #[arg(long, default_value = "0")]
         omp_threads: usize,
+
+        /// TTL in seconds passed to `timeout(1)` wrapping each classify.py call.
+        /// Orphaned Python workers self-terminate after this many seconds.
+        /// Should match the CC --task-ttl-secs value.
+        #[arg(long, default_value = "60")]
+        task_ttl_secs: u64,
     },
 
     /// Run as a worker agent (usually spawned by a local controller)
@@ -166,6 +172,11 @@ enum Role {
         /// 0 = let PyTorch use its default (all cores).
         #[arg(long, default_value = "0")]
         omp_threads: usize,
+
+        /// TTL in seconds passed to `timeout(1)` wrapping each classify.py call.
+        /// Orphaned Python workers self-terminate after this many seconds.
+        #[arg(long, default_value = "60")]
+        task_ttl_secs: u64,
     },
 }
 
@@ -236,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
             image_base_path,
             python,
             omp_threads,
+            task_ttl_secs,
         } => {
             let config = local_controller::LocalControllerConfig {
                 node_id,
@@ -247,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
                 image_base_path,
                 python,
                 omp_threads,
+                task_ttl_secs,
             };
             local_controller::run(config).await
         }
@@ -259,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
             image_base_path,
             python,
             omp_threads,
+            task_ttl_secs,
         } => {
             let config = agent::AgentConfig {
                 agent_id,
@@ -268,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 image_base_path,
                 python,
                 omp_threads,
+                task_ttl_secs,
             };
             agent::run(config).await
         }

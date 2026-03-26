@@ -566,8 +566,9 @@ fn run_deploy(
     // start Cluster Controllers
     log_buf.push(format!("[2/3] Starting {} cluster controllers…", num_cc));
     let mut cc_started: Vec<String> = Vec::new();
-    // (node, binary, args) — used by the watchdog to restart crashed CCs.
-    let mut cc_watchlist: Vec<(String, String, String)> = Vec::new();
+    // (node, binary, args, data_dir) — used by the watchdog to restart crashed CCs.
+    // data_dir is stored so the watchdog can wipe stale Raft state before restarting.
+    let mut cc_watchlist: Vec<(String, String, String, String)> = Vec::new();
 
     for (i, (node, port)) in cc_assignments.iter().enumerate() {
         let node_id = i + 1;
@@ -597,7 +598,7 @@ fn run_deploy(
         if ssh_run(node, &cmd) {
             log_buf.push(format!("  CC{} @ {}:{} … ok", node_id, node, port));
             cc_started.push(format!("{}:{}", node, port));
-            cc_watchlist.push((node.clone(), binary_str.to_string(), node_args));
+            cc_watchlist.push((node.clone(), binary_str.to_string(), node_args, data_dir));
         } else {
             log_buf.push(format!("  CC{} @ {}:{} … FAILED", node_id, node, port));
         }
@@ -646,13 +647,17 @@ fn run_deploy(
             let node_id = format!("lc-{}", node);
             let lc_args = format!(
                 "local-controller --node-id {} --bind 0.0.0.0:{} --cc-addrs {} \
-                 --agents {} --extractor-script {} --image-base-path {} --python {}",
-                node_id, port, peer_list, agents, classify_script_str, IMAGE_DIR, venv_python_str
+                 --agents {} --extractor-script {} --image-base-path {} --python {} \
+                 --task-ttl-secs {}",
+                node_id, port, peer_list, agents, classify_script_str, IMAGE_DIR, venv_python_str,
+                task_ttl_secs
             );
             let restart_args_template = format!(
                 "local-controller --node-id {} --bind 0.0.0.0:{{PORT}} --cc-addrs {} \
-                 --agents 0 --extractor-script {} --image-base-path {} --python {}",
-                node_id, peer_list, classify_script_str, IMAGE_DIR, venv_python_str
+                 --agents 0 --extractor-script {} --image-base-path {} --python {} \
+                 --task-ttl-secs {}",
+                node_id, peer_list, classify_script_str, IMAGE_DIR, venv_python_str,
+                task_ttl_secs
             );
 
             let log_file = format!("{}/lc-{}.log", log_dir_str, node);
@@ -1309,7 +1314,7 @@ fn telemetry_poller(
 /// Monitors CC processes via SSH and restarts them on the same node if crashed.
 /// Runs every 10s. No replacement logic (Raft doesn't support dynamic membership).
 fn cc_monitor(
-    cc_entries: Vec<(String, String, String)>,
+    cc_entries: Vec<(String, String, String, String)>,
     log_dir: String,
     dashboard: Arc<Mutex<DashboardState>>,
     log_buf: LogBuffer,
@@ -1325,7 +1330,7 @@ fn cc_monitor(
     loop {
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
-        for (i, (node, binary, args)) in cc_entries.iter().enumerate() {
+        for (i, (node, binary, args, data_dir)) in cc_entries.iter().enumerate() {
             let alive = ssh_run(node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1");
             if alive {
                 was_down[i] = false;
@@ -1339,6 +1344,10 @@ fn cc_monitor(
                 d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_crash", node: node.clone() });
             }
             log_buf.push(format!("[watchdog] CC on {} not running — restarting…", node));
+            // Wipe stale Raft state so the restarted CC rejoins with a clean log
+            // and replicates from the current leader instead of replaying a
+            // possibly-corrupt on-disk log.
+            ssh_run(node, &format!("rm -rf {}/raft", data_dir));
             let log_file = format!("{}/cc-{}.log", log_dir, node);
             if ssh_start(node, binary, args, &log_file) {
                 let mut d = dashboard.lock().unwrap();

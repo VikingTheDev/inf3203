@@ -14,6 +14,9 @@ pub struct AgentConfig {
     /// Number of OpenMP/MKL threads for the Python feature extractor.
     /// 0 = let PyTorch use its default (all cores).
     pub omp_threads: usize,
+    /// Wrap each classify.py invocation with `timeout {task_ttl_secs}` so
+    /// orphaned Python workers self-terminate if the agent process dies.
+    pub task_ttl_secs: u64,
 }
 
 /// Main entry point for the agent worker.
@@ -256,7 +259,11 @@ async fn process_batch(
         stdin_buf.push('\n');
     }
 
-    let mut child = tokio::process::Command::new(&config.python)
+    // Wrap with `timeout` so classify.py self-terminates after task_ttl_secs
+    // even if its parent agent process has already died (orphan prevention).
+    let mut child = tokio::process::Command::new("timeout")
+        .arg(config.task_ttl_secs.to_string())
+        .arg(&config.python)
         .arg(&config.extractor_script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

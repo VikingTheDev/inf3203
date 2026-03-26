@@ -17,6 +17,9 @@ pub struct LocalControllerConfig {
     pub python: String,
     /// Number of OpenMP threads per agent. 0 = auto (total_cores / agent_count).
     pub omp_threads: usize,
+    /// TTL in seconds passed to `timeout(1)` wrapping each classify.py invocation.
+    /// Ensures orphaned Python workers self-terminate after at most this many seconds.
+    pub task_ttl_secs: u64,
 }
 
 /// Tracks the state of a locally managed agent process.
@@ -89,7 +92,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
     // No other tasks are running yet so holding the lock here is fine.
     if agent_count > 0 {
         // Extract config data without holding the lock during the spawn syscalls.
-        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path, python, omp_threads) = {
+        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path, python, omp_threads, task_ttl_secs) = {
             let g = state.lock().await;
             let omp = effective_omp_threads(g.config.omp_threads, g.config.agent_count);
             (
@@ -100,6 +103,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
                 g.config.image_base_path.clone(),
                 g.config.python.clone(),
                 omp,
+                g.config.task_ttl_secs,
             )
         };
         let lc_addr = format!("127.0.0.1:{}", lc_port);
@@ -124,6 +128,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
                 &image_base_path,
                 &python,
                 omp_threads,
+                task_ttl_secs,
             ) {
                 Ok(agent) => {
                     tracing::info!("Spawned agent {}", agent_id);
@@ -289,6 +294,7 @@ fn spawn_agent(
     image_base_path: &str,
     python: &str,
     omp_threads: usize,
+    task_ttl_secs: u64,
 ) -> anyhow::Result<ManagedAgent> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Cannot determine current executable: {}", e))?;
@@ -309,6 +315,8 @@ fn spawn_agent(
         .arg(python)
         .arg("--omp-threads")
         .arg(omp_threads.to_string())
+        .arg("--task-ttl-secs")
+        .arg(task_ttl_secs.to_string())
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn agent process: {}", e))?;
 
@@ -332,7 +340,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
 
         // Collect IDs of dead agents and config data needed for respawning —
         // all under a single short-lived lock.
-        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path, python, omp_threads) = {
+        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path, python, omp_threads, task_ttl_secs) = {
             let mut g = app.state.lock().await;
             let lc_port = g.config.bind.port();
             let lc_addr = format!("127.0.0.1:{}", lc_port);
@@ -341,6 +349,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
             let image_base_path = g.config.image_base_path.clone();
             let python = g.config.python.clone();
             let omp = effective_omp_threads(g.config.omp_threads, g.config.agent_count);
+            let task_ttl_secs = g.config.task_ttl_secs;
 
             let mut dead_ids = Vec::new();
             for (id, agent) in g.agents.iter_mut() {
@@ -366,6 +375,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
                 image_base_path,
                 python,
                 omp,
+                task_ttl_secs,
             )
         }; // Lock released before spawning.
 
@@ -380,6 +390,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
                 &image_base_path,
                 &python,
                 omp_threads,
+                task_ttl_secs,
             ) {
                 Ok(agent) => {
                     tracing::info!("Respawned agent {}", agent_id);
@@ -527,6 +538,7 @@ async fn handle_activate(
     let cc_addrs = g.config.cc_addrs.clone();
     let node_id = g.config.node_id.clone();
     let omp_threads = effective_omp_threads(g.config.omp_threads, req.agent_count);
+    let task_ttl_secs = g.config.task_ttl_secs;
 
     // Spawn agents outside the lock (process creation can be slow).
     drop(g);
@@ -542,6 +554,7 @@ async fn handle_activate(
             &req.image_base_path,
             &req.python,
             omp_threads,
+            task_ttl_secs,
         ) {
             Ok(agent) => {
                 tracing::info!("Spawned agent {}", agent_id);
