@@ -182,8 +182,15 @@ enum Role {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    // Initialize logging. Respects RUST_LOG if set; defaults to INFO so that
+    // operational events (elections, TTL expirations, step-downs) are visible
+    // without requiring environment configuration on every cluster node.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     // Parse command-line arguments to determine what role this node has
     let cli = Cli::parse();

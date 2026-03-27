@@ -182,7 +182,11 @@ async fn find_leader(app: &AppState) -> anyhow::Result<String> {
 
     for cc_addr in &cc_addrs {
         let url = format!("http://{}/leader", cc_addr);
-        match app.client.get(&url).send().await {
+        // Short per-request timeout: a CC that accepts the TCP connection but
+        // stalls (e.g. busy with Raft election) must not block us for the full
+        // 30-second client timeout. 3 CCs × 3s = 9s worst-case to discover
+        // the leader, vs 3 CCs × 30s = 90s with the default.
+        match app.client.get(&url).timeout(Duration::from_secs(3)).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.json::<LeaderResponse>().await {
                     if let Some(addr) = body.leader_address {
@@ -473,7 +477,7 @@ async fn heartbeat_loop(app: AppState) {
         match find_leader(&app).await {
             Ok(leader) => {
                 let url = format!("http://{}/heartbeat", leader);
-                if let Err(e) = app.client.post(&url).json(&req).send().await {
+                if let Err(e) = app.client.post(&url).json(&req).timeout(Duration::from_secs(5)).send().await {
                     tracing::warn!("Heartbeat to CC failed: {}", e);
                     // Clear stale leader cache so the next call re-discovers.
                     app.state.lock().await.current_leader = None;

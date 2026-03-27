@@ -180,7 +180,7 @@ fn ssh_run(node: &str, cmd: &str) -> bool {
 /// Waits 2s then verifies the process is actually running.
 fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
     let cmd = format!(
-        "nohup {} {} </dev/null >>{} 2>&1 &",
+        "RUST_LOG=info nohup {} {} </dev/null >>{} 2>&1 &",
         binary, args, log_file
     );
     if !ssh_run(node, &cmd) {
@@ -591,7 +591,7 @@ fn run_deploy(
         // Wipe old Raft state on the target node (start fresh every time we deploy new cluster).
         // Initial start uses --hold; restarts (in watchdog) do not.
         let cmd = format!(
-            "rm -rf {} ; nohup {} {} --hold </dev/null >>{} 2>&1 &",
+            "rm -rf {} ; RUST_LOG=info nohup {} {} --hold </dev/null >>{} 2>&1 &",
             data_dir, binary_str, node_args, log_file
         );
         if ssh_run(node, &cmd) {
@@ -1324,7 +1324,11 @@ fn cc_monitor(
     log_buf: LogBuffer,
 ) {
     const INTERVAL_SECS: u64 = 5;
-    let mut was_down: Vec<bool> = vec![false; cc_entries.len()];
+    // Delay between detecting a CC crash and restarting it. Long enough to
+    // observe the Raft re-election and quorum loss before the node comes back.
+    const RESTART_DELAY_SECS: u64 = 10;
+
+    let mut down_since: Vec<Option<std::time::Instant>> = vec![None; cc_entries.len()];
 
     log_buf.push(format!(
         "[watchdog] CC monitor started — watching {} nodes",
@@ -1337,17 +1341,34 @@ fn cc_monitor(
         for (i, (node, binary, args)) in cc_entries.iter().enumerate() {
             let alive = ssh_run(node, "pgrep -f '[i]nf3203_aika' > /dev/null 2>&1");
             if alive {
-                was_down[i] = false;
+                down_since[i] = None;
                 continue;
             }
-            // Only count the crash once per episode.
-            if !was_down[i] {
-                was_down[i] = true;
+
+            // First detection of this crash episode.
+            if down_since[i].is_none() {
+                down_since[i] = Some(std::time::Instant::now());
                 let mut d = dashboard.lock().unwrap();
                 d.cc_crashes += 1;
                 d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_crash", node: node.clone() });
+                log_buf.push(format!(
+                    "[watchdog] CC on {} not running — waiting {}s before restart",
+                    node, RESTART_DELAY_SECS
+                ));
+                continue;
             }
-            log_buf.push(format!("[watchdog] CC on {} not running — restarting…", node));
+
+            // Still within the delay window — just wait.
+            let elapsed = down_since[i].unwrap().elapsed().as_secs();
+            if elapsed < RESTART_DELAY_SECS {
+                log_buf.push(format!(
+                    "[watchdog] CC on {} still down ({}s / {}s delay)",
+                    node, elapsed, RESTART_DELAY_SECS
+                ));
+                continue;
+            }
+
+            log_buf.push(format!("[watchdog] CC on {} restarting now…", node));
             // Persistent Raft state (term, voted_for, log) is left intact.
             // The CC rejoins with its last known term and log; the leader sends
             // only the missing tail entries to catch it up.
@@ -1356,7 +1377,7 @@ fn cc_monitor(
                 let mut d = dashboard.lock().unwrap();
                 d.cc_restarts += 1;
                 d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_restart", node: node.clone() });
-                was_down[i] = false;
+                down_since[i] = None;
                 log_buf.push(format!("[watchdog] CC on {} restarted ok", node));
             } else {
                 log_buf.push(format!(
