@@ -431,7 +431,11 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
                     continue;
                 }
 
-                let is_leader = ingest_app.raft.is_leader();
+                // Use the async (lock-awaiting) variant so we never get a
+                // spurious false from try_lock contention under load. A wrong
+                // false would reset ingestion_complete and trigger a redundant
+                // NFS directory scan of 1.2M files, starving all agents.
+                let is_leader = ingest_app.raft.is_leader_async().await;
                 if !is_leader {
                     was_leader = false;
                     ingestion_complete = false;

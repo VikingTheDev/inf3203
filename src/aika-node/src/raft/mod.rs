@@ -410,11 +410,22 @@ impl RaftNode {
     }
 
     /// Check if this node is currently the Raft leader.
+    ///
+    /// Uses `try_lock` — returns `false` when the state lock is contended.
+    /// Safe for sync callers (e.g. dashboard polling) but **not** for logic
+    /// that must be correct under load (use `is_leader_async` instead).
     pub fn is_leader(&self) -> bool {
         self.state
             .try_lock()
             .map(|s| s.is_leader())
             .unwrap_or(false)
+    }
+
+    /// Reliable async version of `is_leader` — awaits the lock instead of
+    /// trying. Use this from async contexts where correctness matters (e.g.
+    /// the ingestion loop), to avoid spurious `false` returns under load.
+    pub async fn is_leader_async(&self) -> bool {
+        self.state.lock().await.is_leader()
     }
 
     /// Get the current leader's ID and address, if known.
