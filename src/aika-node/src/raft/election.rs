@@ -321,7 +321,7 @@ where
     T: RaftTransport<C>,
 {
     // Lock state then log (consistent ordering with all other call sites).
-    {
+    let noop_entry = {
         let mut state_guard = state.lock().await;
         let mut log_guard = log.lock().await;
 
@@ -343,11 +343,22 @@ where
             Some(LeaderState::initialise(&state_guard.peers, last_log_index));
 
         // Append a no-op entry so previous-term entries can be committed.
-        log_guard.append_command(term, C::default());
+        let noop_index = log_guard.append_command(term, C::default());
+        let noop_entry = log_guard.get(noop_index).unwrap().clone();
 
-        info!("became leader for term {term}");
+        info!("became leader for term {term}, log last_index={noop_index}");
+        noop_entry
         // Both locks released here.
-    }
+    };
+
+    // Persist the no-op entry before broadcasting heartbeat.
+    // Must happen outside the lock (consistent with the propose path) and before
+    // replication tasks start — otherwise a crash between append and persist
+    // leaves the disk log missing the no-op, causing "log starts at index N+2"
+    // on restart.
+    storage
+        .append_log_entries(&[noop_entry])
+        .expect("failed to persist no-op entry on becoming leader");
 
     // Broadcast heartbeat — no locks held.
     super::replication::broadcast_heartbeat(state, log, transport, storage).await;

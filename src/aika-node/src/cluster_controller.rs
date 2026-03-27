@@ -688,15 +688,34 @@ async fn ttl_reaper_loop(app: AppState, ttl_secs: u64) {
 
         let now = unix_now();
         // Brief lock to collect expired IDs — no I/O while holding it.
-        let expired = {
-            app.sm
-                .lock()
-                .expect("sm lock")
-                .expired_batches(now, ttl_secs)
+        let (expired, pending_count, assigned_count, queue_depth, total_ttl) = {
+            let sm = app.sm.lock().expect("sm lock");
+            let expired = sm.expired_batches(now, ttl_secs);
+            let mut pending = 0u64;
+            let mut assigned = 0u64;
+            for b in sm.tasks.values() {
+                match b.status {
+                    TaskStatus::Pending => pending += 1,
+                    TaskStatus::Assigned { .. } => assigned += 1,
+                    _ => {}
+                }
+            }
+            (expired, pending, assigned, sm.pending_queue.len(), sm.ttl_expirations)
         };
 
+        if !expired.is_empty() {
+            tracing::warn!(
+                "TTL reaper: {} batches expired (pending={} assigned={} queue_depth={} total_ttl_expirations={})",
+                expired.len(), pending_count, assigned_count, queue_depth, total_ttl + expired.len() as u64,
+            );
+        } else {
+            tracing::debug!(
+                "TTL reaper: no expirations (pending={} assigned={} queue_depth={} total_ttl_expirations={})",
+                pending_count, assigned_count, queue_depth, total_ttl,
+            );
+        }
+
         for batch_id in expired {
-            tracing::info!("TTL expired for batch {}, returning to Pending", batch_id);
             if let Err(e) = app.raft.propose(Command::ExpireTask { batch_id }).await {
                 tracing::warn!("Failed to propose ExpireTask for batch {}: {}", batch_id, e);
             }

@@ -181,6 +181,12 @@ impl RaftState {
     ///
     /// Raft paper: Figure 2, "Rules for Servers", "All Servers" bullet 2.
     pub fn step_down_to_follower(&mut self, storage: &RaftStorage, new_term: Term) {
+        tracing::info!(
+            "stepping down to follower: term {} → {} (was {:?})",
+            self.persistent.current_term,
+            new_term,
+            self.role,
+        );
         // Set new terms
         self.persistent.current_term = new_term;
         // Clear vote

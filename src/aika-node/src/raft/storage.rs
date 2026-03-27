@@ -62,6 +62,7 @@ impl RaftStorage {
     /// Used after log truncation or when starting fresh. Uses write-then-rename
     /// to avoid partial writes.
     pub fn save_log<C: Serialize>(&self, entries: &[LogEntry<C>]) -> Result<()> {
+        let start = std::time::Instant::now();
         let path = self.data_dir.join("persistent_log.ndjson");
         let tmp = self.data_dir.join("persistent_log.ndjson.tmp");
 
@@ -73,6 +74,15 @@ impl RaftStorage {
         file.flush()?;
         drop(file);
         fs::rename(tmp, path)?;
+
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() > 50 {
+            warn!(
+                "save_log rewrote {} entries in {}ms (slow — potential lock contention)",
+                entries.len(),
+                elapsed.as_millis()
+            );
+        }
 
         Ok(())
     }

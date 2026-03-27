@@ -272,6 +272,17 @@ impl RaftNode {
 
                     // ── Election timer fired ──────────────────────────────────
                     Some(()) = election_timeout_rx.recv() => {
+                        {
+                            let sg = el_state.lock().await;
+                            let lg = el_log.lock().await;
+                            tracing::info!(
+                                "election timer fired: role={:?} term={} last_index={} last_term={}",
+                                sg.role,
+                                sg.persistent.current_term,
+                                lg.last_index(),
+                                lg.last_term(),
+                            );
+                        }
                         votes_received = 1; // self-vote is implicit in start_election
                         let _ = election::start_election(
                             Arc::clone(&el_state),
@@ -483,6 +494,16 @@ impl RaftNode {
                 .save_persistent_state(&state_guard.persistent)
                 .expect("failed to persist voted_for");
 
+            tracing::info!(
+                "vote GRANTED to {} for term {} (our log: last_index={} last_term={}; candidate: last_index={} last_term={})",
+                args.candidate_id,
+                current_term,
+                log_guard.last_index(),
+                log_guard.last_term(),
+                args.last_log_index,
+                args.last_log_term,
+            );
+
             // 5. Reset election timer so we don't trigger a spurious election
             //    immediately after granting a vote (Raft §5.2).
             drop(state_guard);
@@ -501,6 +522,19 @@ impl RaftNode {
         // own election. Without this, a node that steps down but denies
         // immediately re-fires its own election, ping-ponging with the
         // candidate indefinitely.
+        tracing::info!(
+            "vote DENIED to {} for term {} (can_vote={}, log_ok={}, stepped_down={}, our log: last_index={} last_term={}; candidate: last_index={} last_term={})",
+            args.candidate_id,
+            current_term,
+            can_vote,
+            log_ok,
+            stepped_down,
+            log_guard.last_index(),
+            log_guard.last_term(),
+            args.last_log_index,
+            args.last_log_term,
+        );
+
         drop(state_guard);
         drop(log_guard);
         if stepped_down {
