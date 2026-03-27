@@ -278,8 +278,10 @@ async fn process_batch(
         stdin_buf.push('\n');
     }
 
-    // Wrap with `timeout` so classify.py self-terminates after task_ttl_secs
-    // even if its parent agent process has already died (orphan prevention).
+    // Wrap with `timeout` so classify.py self-terminates after task_ttl_secs.
+    // This aligns with the CC's TTL deadline: when the CC reclaims the batch,
+    // classify.py is killed too (continuing is wasted NFS I/O — another agent
+    // will redo the work). Also prevents orphaned processes if the agent dies.
     let mut child = tokio::process::Command::new("timeout")
         .arg(config.task_ttl_secs.to_string())
         .arg(&config.python)

@@ -135,7 +135,8 @@ enum Role {
         omp_threads: usize,
 
         /// TTL in seconds passed to `timeout(1)` wrapping each classify.py call.
-        /// Orphaned Python workers self-terminate after this many seconds.
+        /// Aligns classify.py lifetime with the CC task TTL so that when the CC
+        /// reclaims an expired batch, the classify.py for that batch is also killed.
         /// Should match the CC --task-ttl-secs value.
         #[arg(long, default_value = "60")]
         task_ttl_secs: u64,
