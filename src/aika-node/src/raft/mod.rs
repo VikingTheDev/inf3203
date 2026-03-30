@@ -454,8 +454,6 @@ impl RaftNode {
 
     /// Handle an incoming `RequestVote` RPC from a candidate.
     ///
-    /// Raft paper: Figure 2, "RequestVote RPC", "Receiver implementation".
-    ///
     /// Called by the CC HTTP server on `POST /raft/request_vote`.
     /// Rules (Raft §5.2 + §5.4):
     ///   1. If `args.term < current_term` → deny.

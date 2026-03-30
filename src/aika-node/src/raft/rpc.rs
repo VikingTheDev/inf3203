@@ -19,8 +19,6 @@ use super::{
 // region RequestVote
 
 /// Arguments sent by a candidate to every other node to solicit a vote.
-///
-/// Raft paper: Figure 2, "RequestVote RPC", "Arguments".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteArgs {
     /// Candidate's current term.
@@ -37,8 +35,6 @@ pub struct RequestVoteArgs {
 }
 
 /// Reply from a voter to a `RequestVote` RPC.
-///
-/// Raft paper: Figure 2, "RequestVote RPC", "Results".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteReply {
     /// The voter's current term (so the candidate can step down if stale).
@@ -56,8 +52,6 @@ pub struct RequestVoteReply {
 ///
 /// When `entries` is empty this is a heartbeat; followers reset their
 /// election timer without needing to append anything.
-///
-/// Raft paper: Figure 2, "AppendEntries RPC", "Arguments".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesArgs<C> {
     /// Leader's current term.
@@ -81,8 +75,6 @@ pub struct AppendEntriesArgs<C> {
 }
 
 /// Reply from a follower to an `AppendEntries` RPC.
-///
-/// Raft paper: Figure 2, "AppendEntries RPC", "Results".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesReply {
     /// The follower's current term (so the leader can step down if stale).

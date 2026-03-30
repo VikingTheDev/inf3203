@@ -29,9 +29,7 @@ use super::{
     storage::RaftStorage,
 };
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+// region Configuration
 
 /// Tunable parameters for the election subsystem.
 #[derive(Debug, Clone)]
@@ -52,16 +50,14 @@ impl Default for ElectionConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Election timer
-// ---------------------------------------------------------------------------
+// endregion
+
+// region Election timer
 
 /// Handle to the background election timer task.
 ///
 /// The timer is reset every time the node receives a heartbeat or grants a
 /// vote.  When it fires, the node starts an election.
-///
-/// Raft paper: §5.2, paragraph 1.
 ///
 /// Internally uses a `tokio::sync::watch` channel: the timer task reads the
 /// latest `Instant` at which the deadline was last reset; any change to that
@@ -125,14 +121,12 @@ impl ElectionTimer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Starting an election
-// ---------------------------------------------------------------------------
+// endregion
+
+// region starting election
 
 /// Transition this node from Follower → Candidate and broadcast
 /// `RequestVote` RPCs to all peers.
-///
-/// Raft paper: §5.2, paragraph 3; Figure 2, "Rules for Servers", "Candidates" bullet 1.
 ///
 /// Steps (per Raft §5.2):
 ///   1. Lock state, increment `current_term`, set role to Candidate,
@@ -229,14 +223,12 @@ where
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Handling vote responses
-// ---------------------------------------------------------------------------
+// endregion
+
+// region handling vote response
 
 /// Process a single `RequestVoteReply` received from `peer`.
-///
-/// Raft paper: §5.2, paragraph 3; Figure 2, "Rules for Servers", "Candidates" bullet 2.
-///
+
 /// Returns `true` when the node has just won the election (gathered a
 /// majority of votes for `election_term`), indicating the caller should call
 /// `become_leader`.
@@ -249,7 +241,7 @@ where
 ///      ignore (stale reply from a previous election) and return `false`.
 ///   4. If `reply.vote_granted`, increment vote tally.
 ///   5. If tally > (cluster_size / 2), return `true`.
-///   6. Otherwise return `false`.
+///   6. Otherwise, return `false`.
 ///
 /// The `votes_received` counter lives outside the lock — it is a local
 /// variable in the task that collects replies — so no lock contention occurs
@@ -284,20 +276,18 @@ pub async fn handle_vote_response(
     *votes_received > cluster_size / 2
 }
 
-// ---------------------------------------------------------------------------
-// Becoming leader
-// ---------------------------------------------------------------------------
+// endregion
+
+// region become leader
 
 /// Transition the node from Candidate → Leader after winning the election.
-///
-/// Raft paper: §5.2, paragraph 4; §5.4.2 (no-op commit); Figure 2, "Rules for Servers", "Leaders" bullet 1.
 ///
 /// Steps (per Raft §5.2 and the Leader Completeness rule):
 ///   1. Lock state.
 ///   2. Double-check we are still Candidate in the expected term (guards
 ///      against a race where another leader sent a higher-term message).
 ///   3. Set `role = Leader`, record `volatile.current_leader = Some(self.id)`.
-///   4. Initialise `leader_state` via `LeaderState::initialise` with the
+///   4. Initialize `leader_state` via `LeaderState::initialize` with the
 ///      current last log index.
 ///   5. Append a no-op log entry in the current term so the leader can
 ///      commit entries from previous terms (Leader Completeness §5.4).
@@ -366,9 +356,9 @@ where
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// endregion
+
+// region helpers
 
 /// Pick a random election timeout duration within the configured range.
 pub fn random_timeout(config: &ElectionConfig) -> Duration {
@@ -377,3 +367,5 @@ pub fn random_timeout(config: &ElectionConfig) -> Duration {
     let ms = rand::rng().random_range(min_ms..max_ms);
     Duration::from_millis(ms)
 }
+
+// endregion

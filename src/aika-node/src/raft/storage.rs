@@ -1,7 +1,5 @@
 /// Handles reading and writing Raft persistent state to the local filesystem.
 ///
-/// Raft paper: §5.2, paragraph 1 (persistent state); Figure 2, "Persistent state on all servers".
-///
 /// Each node writes to its own data directory (`/tmp/inf3203_raft_<node_id>/`).
 /// This directory must be local, not on distributed fs (can't use distributed fs for communication).
 ///

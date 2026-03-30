@@ -45,8 +45,6 @@ impl Default for Role {
 
 /// Fields that **must** be persisted to stable storage before responding to any RPC.
 /// On recovery the node reloads these from disk.
-///
-/// Raft paper: Figure 2, "Persistent state on all servers".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistentState {
     /// Latest term the server has seen.  Initialised to 0 and only ever increases.
@@ -67,8 +65,6 @@ impl Default for PersistentState {
 }
 
 /// Fields kept in memory on every node. Safe to re-derive after a crash.
-///
-/// Raft paper: Figure 2, "Volatile state on all servers".
 #[derive(Debug, Clone, Default)]
 pub struct VolatileState {
     /// Index of the highest log entry known to be committed (replicated on a majority).
@@ -85,8 +81,6 @@ pub struct VolatileState {
 
 /// Per-peer replication tracking, maintained only while this node is leader.
 /// Re-initialized to defaults immediately after winning an election.
-///
-/// Raft paper: Figure 2, "Volatile state on leaders".
 #[derive(Debug, Clone)]
 pub struct PeerReplicationState {
     /// Index of the next log entry to send to this peer.
@@ -178,8 +172,6 @@ impl RaftState {
     ///
     /// Must be called (and state persisted) whenever an incoming message
     /// carries a term greater than `current_term`.
-    ///
-    /// Raft paper: Figure 2, "Rules for Servers", "All Servers" bullet 2.
     pub fn step_down_to_follower(&mut self, storage: &RaftStorage, new_term: Term) {
         tracing::info!(
             "stepping down to follower: term {} → {} (was {:?})",

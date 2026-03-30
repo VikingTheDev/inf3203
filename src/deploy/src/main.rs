@@ -4,11 +4,6 @@
 /// (which must be on the NFS shared filesystem so all cluster nodes can reach
 /// it), then SSH-starts each role using that shared path.
 /// No per-node binary download is needed.
-///
-/// Role allocation for N requested nodes (N ≥ 3):
-///   Nodes 1–3  →  Cluster Controller  (3-node Raft quorum)
-///   Node  4    →  Local Controller replica  (--agents 0, standby)
-///   Nodes 5–N  →  Local Controller active   (--agents 4)
 mod dashboard;
 
 use rand::Rng;
@@ -805,8 +800,8 @@ fn run_deploy(
 // Watchdog (set up using Claude Code Sonnet 4.6 in Agent Mode)
 // Created in three steps
 // First prompt asked to create a watchdog that can restart crashed LC (Local Controller) nodes,
-// since the current solution can only handle one crash before we run out of replicas, so we need
-// to replenish the replica so that we can handle further failures.
+// since the current solution can only handle N crashes before we run out of replicas, so we need
+// to replenish the replicas so that we can handle further failures.
 
 // Second prompt asked to also handle cases where the LC nodes goes completely down, in those cases
 // we should find a new available node and start a new LC there. After the first prompt the node

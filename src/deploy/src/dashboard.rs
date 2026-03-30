@@ -19,6 +19,9 @@ use ratatui::{
 
 use crate::{fmt_duration, fmt_num, DashboardState};
 
+// TUI Dashboard using Ratatui.rs
+// Set up using Claude Code in Agent mode with Human guidance.
+
 // ── Startup config TUI ──────────────────────────────────────────────────────
 
 /// User-configurable cluster parameters chosen in the startup TUI.

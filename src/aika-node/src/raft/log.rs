@@ -118,8 +118,6 @@ impl<C: Clone + std::fmt::Debug> RaftLog<C> {
     /// Check whether the caller's log is **at least as up-to-date** as this
     /// log, per the Raft election restriction.
     ///
-    /// Raft paper: §5.4.1, paragraph 2.
-    ///
     /// Returns `true` when:
     ///   - `candidate_last_term > self.last_term()`, OR
     ///   - terms are equal AND `candidate_last_index >= self.last_index()`.
@@ -174,8 +172,6 @@ impl<C: Clone + std::fmt::Debug> RaftLog<C> {
     }
 
     /// Append a batch of entries received from the leader (follower path).
-    ///
-    /// Raft paper: Figure 2, "AppendEntries RPC", "Receiver implementation" steps 3–4.
     ///
     /// Implements the Raft conflict-detection rule:
     ///   1. For each incoming entry, if an existing entry at the same index

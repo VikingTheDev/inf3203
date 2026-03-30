@@ -226,7 +226,7 @@ impl StateMachine {
     }
 
     /// Pop and return the next pending batch, lazily skipping stale entries.
-    /// O(1) amortised instead of O(n) linear scan.
+    /// O(1) amortized instead of O(n) linear scan.
     fn next_pending_batch(&mut self) -> Option<TaskBatch> {
         while let Some(&batch_id) = self.pending_queue.front() {
             if let Some(batch) = self.tasks.get(&batch_id) {

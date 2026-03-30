@@ -149,8 +149,6 @@ where
 
 /// Execute one round of `AppendEntries` toward `peer`.
 ///
-/// Raft paper: Figure 2, "Rules for Servers", "Leaders" bullets 2–3.
-///
 /// This is the core replication routine called repeatedly by the per-peer task.
 /// It handles both normal log replication and the case where the follower's log
 /// is behind or has conflicts.
@@ -160,7 +158,7 @@ where
 ///   2. Lock log; build `AppendEntriesArgs`:
 ///        - `prev_log_index = next_index - 1`
 ///        - `prev_log_term  = log.get(prev_log_index).map(|e| e.term).unwrap_or(0)`
-///        - `entries        = log.entries_from(next_index)` (may be empty)
+///        - `entries        = log.entries_from(next_index)` (could be empty)
 ///        - `leader_commit  = volatile.commit_index`
 ///   3. Release both locks, call `transport.send_append_entries`.
 ///   4. On success (`reply.success == true`):
@@ -289,8 +287,6 @@ where
 
 /// Broadcast an empty `AppendEntries` (heartbeat) to every peer concurrently.
 ///
-/// Raft paper: §5.2, paragraph 4.
-///
 /// Used immediately after becoming leader and then on each heartbeat tick.
 /// Spawns one short-lived task per peer; does not wait for all replies.
 /// Replies that contain a higher term cause a step-down to Follower.
@@ -369,8 +365,6 @@ pub async fn broadcast_heartbeat<C, T>(
 /// Advance `commit_index` if a new log index has been replicated on a
 /// majority of servers, then trigger application to the state machine.
 ///
-/// Raft paper: Figure 2, "Rules for Servers", "Leaders" bullet 4; §5.3, paragraph 4; §5.4.2.
-///
 /// Must be called after every successful `AppendEntries` reply that updated
 /// a peer's `match_index`.
 ///
@@ -443,8 +437,6 @@ pub async fn advance_commit_index<C>(
 /// Apply all log entries in `(last_applied, commit_index]` to the state
 /// machine in order, advancing `last_applied` as we go.
 ///
-/// Raft paper: Figure 2, "Rules for Servers", "All Servers" bullet 1.
-///
 /// Sends each entry as an `ApplyMsg` on `apply_tx`.  The receiver (the state
 /// machine goroutine / task) processes commands in the order they arrive.
 ///
@@ -501,8 +493,6 @@ pub async fn apply_committed_entries<C>(
 // region Follower
 
 /// Validate and apply an `AppendEntries` RPC on a follower (or candidate).
-///
-/// Raft paper: Figure 2, "AppendEntries RPC", "Receiver implementation" steps 1–5.
 ///
 /// Returns the `AppendEntriesReply` to send back to the leader.
 ///

@@ -58,7 +58,7 @@ async fn work_loop(
     client: &reqwest::Client,
 ) -> anyhow::Result<()> {
     loop {
-        // 1. Request a task batch
+        // Request a task batch
         let assignment = match request_task(config, client).await {
             Ok(assignment) => assignment,
             Err(e) => {
@@ -79,7 +79,7 @@ async fn work_loop(
         // Advertise the current batch to the heartbeat loop.
         *current_batch.lock().unwrap() = Some(assignment.batch_id);
 
-        // 2. Process each image in the batch
+        // Process each image in the batch
         let labels = match process_batch(config, &assignment).await {
             Ok(labels) => labels,
             Err(e) => {
@@ -101,7 +101,7 @@ async fn work_loop(
         // Clear batch slot before reporting — the batch is no longer in-flight.
         *current_batch.lock().unwrap() = None;
 
-        // 3. Report completion
+        // Report completion
         let completion = TaskCompletion {
             batch_id: assignment.batch_id,
             agent_id: config.agent_id.clone(),
