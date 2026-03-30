@@ -68,7 +68,7 @@ fn prioritize_nodes(mut candidates: Vec<String>, rng: &mut impl rand::Rng) -> Ve
     let mut result = Vec::new();
     for group in &mut groups {
         group.shuffle(rng);
-        result.extend(group.drain(..));
+        result.append(group);
     }
     result
 }
@@ -204,7 +204,7 @@ fn ensure_venv(install_dir: &Path, classify_script: &Path, log_buf: &LogBuffer) 
         .status()
         .expect("python3 not found — cannot create venv");
     if !status.success() {
-        log_buf.push(format!("ERROR: Failed to create venv"));
+        log_buf.push("ERROR: Failed to create venv".to_string());
         std::process::exit(1);
     }
 
@@ -219,7 +219,7 @@ fn ensure_venv(install_dir: &Path, classify_script: &Path, log_buf: &LogBuffer) 
             .status()
             .expect("pip not found in venv");
         if !status.success() {
-            log_buf.push(format!("ERROR: pip install failed"));
+            log_buf.push("ERROR: pip install failed".to_string());
             std::process::exit(1);
         }
     } else {
@@ -300,7 +300,7 @@ fn ensure_binary(install_dir: &Path, log_buf: &LogBuffer) -> PathBuf {
         .expect("tar not found");
 
     if !status.success() {
-        log_buf.push(format!("ERROR: Failed to extract tarball"));
+        log_buf.push("ERROR: Failed to extract tarball".to_string());
         std::process::exit(1);
     }
 
@@ -520,12 +520,11 @@ fn run_deploy(
     if let Ok(entries) = fs::read_dir(&results_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("results_") && name.ends_with(".ndjson") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("results_") && name.ends_with(".ndjson") {
                     let _ = fs::remove_file(&path);
                     cleared += 1;
                 }
-            }
         }
     }
     if cleared > 0 {
@@ -620,7 +619,7 @@ fn run_deploy(
 
     // start Local Controllers
     if lc_nodes.is_empty() {
-        log_buf.push(format!("[3/3] No LC nodes — CC-only deployment."));
+        log_buf.push("[3/3] No LC nodes — CC-only deployment.".to_string());
     } else {
         let num_active = lc_nodes.len().saturating_sub(num_replicas);
         log_buf.push(format!(
@@ -688,9 +687,9 @@ fn run_deploy(
         log_buf.push(format!("Warning: could not save node list: {}", e));
     }
 
-    log_buf.push(format!("══════════════════════════════════════════"));
-    log_buf.push(format!("  Áika cluster deployed successfully"));
-    log_buf.push(format!("══════════════════════════════════════════"));
+    log_buf.push("══════════════════════════════════════════".to_string());
+    log_buf.push("  Áika cluster deployed successfully".to_string());
+    log_buf.push("══════════════════════════════════════════".to_string());
     log_buf.push(format!("  Binary:   {}", binary_str));
     log_buf.push(format!("  Results:  {}", results_dir_str));
     log_buf.push(format!("  Logs:     {}", log_dir_str));
@@ -703,10 +702,10 @@ fn run_deploy(
         nodes_file.display()
     ));
     log_buf.push(format!("  Cleanup:  {} cleanup", args[0]));
-    log_buf.push(format!("══════════════════════════════════════════"));
+    log_buf.push("══════════════════════════════════════════".to_string());
 
     if !lc_watchlist.is_empty() {
-        log_buf.push(format!("Watchdog active."));
+        log_buf.push("Watchdog active.".to_string());
         let ctx = WatchdogContext {
             binary: binary_str.to_string(),
             classify_script: classify_script_str.to_string(),
@@ -1067,16 +1066,13 @@ fn poll_status(cc_addrs: &[String]) -> Option<StatusResponse> {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output();
-        if let Ok(out) = output {
-            if out.status.success() {
-                if let Ok(resp) = serde_json::from_slice::<LeaderResponse>(&out.stdout) {
-                    if let Some(la) = resp.leader_address {
+        if let Ok(out) = output
+            && out.status.success()
+                && let Ok(resp) = serde_json::from_slice::<LeaderResponse>(&out.stdout)
+                    && let Some(la) = resp.leader_address {
                         leader_addr = Some(la);
                         break;
                     }
-                }
-            }
-        }
     }
 
     // Build the list of addresses to try: leader first, then all others as fallback.
@@ -1100,13 +1096,11 @@ fn poll_status(cc_addrs: &[String]) -> Option<StatusResponse> {
             .stderr(Stdio::null())
             .output();
 
-        if let Ok(out) = output {
-            if out.status.success() {
-                if let Ok(status) = serde_json::from_slice::<StatusResponse>(&out.stdout) {
+        if let Ok(out) = output
+            && out.status.success()
+                && let Ok(status) = serde_json::from_slice::<StatusResponse>(&out.stdout) {
                     return Some(status);
                 }
-            }
-        }
     }
     None
 }
@@ -1153,12 +1147,12 @@ fn timestamp_str() -> String {
     let mut year = 1970u32;
     let mut rem = days;
     loop {
-        let dy = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
+        let dy = if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) { 366 } else { 365 };
         if rem < dy { break; }
         rem -= dy;
         year += 1;
     }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let month_days = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 1u32;
     for &md in &month_days {
@@ -1225,8 +1219,7 @@ fn probe_cc(addr: &str) -> (bool, bool) {
             if let Ok(resp) = serde_json::from_slice::<LeaderResponse>(&out.stdout) {
                 let is_leader = resp
                     .leader_address
-                    .as_deref()
-                    .map_or(false, |la| la == addr);
+                    .as_deref() == Some(addr);
                 (true, is_leader)
             } else {
                 (true, false) // responded but couldn't parse — still alive
@@ -1305,7 +1298,7 @@ fn telemetry_poller(
                     save_telemetry(&d, &telemetry_file);
                 }
                 drop(d);
-                log_buf.push(format!("✅ All tasks completed!"));
+                log_buf.push("✅ All tasks completed!".to_string());
             } else {
                 d.last_status = Some(status);
             }
@@ -1639,11 +1632,10 @@ fn merge_results(cwd: &Path) {
             }
             total_lines += 1;
             // Extract batch_id from the JSON line without a full parse.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(batch_id) = v["batch_id"].as_u64() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(batch_id) = v["batch_id"].as_u64() {
                     seen.entry(batch_id).or_insert_with(|| line.to_string());
                 }
-            }
         }
     }
 

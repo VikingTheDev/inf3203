@@ -98,9 +98,9 @@ fn startup_loop(
         let field = STARTUP_FIELDS[selected];
         terminal.draw(|f| draw_startup(f, &config, field, available_nodes))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
                         KeyCode::Char('c')
@@ -134,8 +134,6 @@ fn startup_loop(
                         _ => {}
                     }
                 }
-            }
-        }
     }
 }
 
@@ -521,9 +519,9 @@ fn tui_loop(
         drop(info_guard);
 
         // Poll for events with a 200ms timeout so the UI refreshes ~5x/sec.
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
                         KeyCode::Char('c')
@@ -549,13 +547,12 @@ fn tui_loop(
                         }
                         KeyCode::Char('k') | KeyCode::Char('K') => {
                             let info_guard = deploy_info.lock().unwrap();
-                            if let Some(di) = info_guard.as_ref() {
-                                if total_nodes > 0 {
+                            if let Some(di) = info_guard.as_ref()
+                                && total_nodes > 0 {
                                     let hostname = node_hostname(di, tui.selected_node);
                                     drop(info_guard);
                                     kill_node(&hostname, log_buf);
                                 }
-                            }
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             if tui.show_results {
@@ -592,8 +589,6 @@ fn tui_loop(
                         _ => {}
                     }
                 }
-            }
-        }
     }
 }
 
@@ -949,7 +944,7 @@ fn draw_nodes(
         let stale = state
             .last_status
             .as_ref()
-            .map_or(false, |s| s.stale_nodes.contains(&lc_id));
+            .is_some_and(|s| s.stale_nodes.contains(&lc_id));
 
         let status_str = if stale {
             "⚠ stale".to_string()
@@ -1417,7 +1412,7 @@ fn send_start_signal(cc_addrs: &[String], log_buf: &LogBuffer) {
                 }
             }
         }
-        log_buf.push(format!("Start signal sent."));
+        log_buf.push("Start signal sent.".to_string());
     });
 }
 
