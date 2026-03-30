@@ -165,7 +165,7 @@ impl RaftNode {
         // happen due to log corruption during rapid leader bouncing), discard the
         // entire log and let the leader resend from scratch. This is always safe:
         // any entries we discard were either uncommitted or will be re-replicated.
-        let entries = if entries.first().map_or(false, |e| e.index != 1) {
+        let entries = if entries.first().is_some_and(|e| e.index != 1) {
             tracing::warn!(
                 "log starts at index {} instead of 1 — discarding and relying on leader resend",
                 entries[0].index
@@ -289,7 +289,7 @@ impl RaftNode {
                             Arc::clone(&el_log),
                             Arc::clone(&el_transport),
                             Arc::clone(&el_storage),
-                            &*el_timer,
+                            &el_timer,
                             vote_reply_tx.clone(),
                         ).await;
                     }

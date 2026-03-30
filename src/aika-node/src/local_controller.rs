@@ -188,12 +188,11 @@ async fn find_leader(app: &AppState) -> anyhow::Result<String> {
         // the leader, vs 3 CCs × 30s = 90s with the default.
         match app.client.get(&url).timeout(Duration::from_secs(3)).send().await {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<LeaderResponse>().await {
-                    if let Some(addr) = body.leader_address {
+                if let Ok(body) = resp.json::<LeaderResponse>().await
+                    && let Some(addr) = body.leader_address {
                         app.state.lock().await.current_leader = Some(addr.clone());
                         return Ok(addr);
                     }
-                }
             }
             Ok(resp) => tracing::debug!("CC {} /leader returned {}", cc_addr, resp.status()),
             Err(e) => tracing::debug!("CC {} unreachable: {}", cc_addr, e),

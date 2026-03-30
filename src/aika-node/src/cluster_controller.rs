@@ -110,16 +110,13 @@ impl StateMachine {
                 batch_id,
                 image_paths,
             } => {
-                if !self.tasks.contains_key(&batch_id) {
-                    self.tasks.insert(
-                        batch_id,
-                        TaskBatch {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(batch_id) {
+                    e.insert(TaskBatch {
                             batch_id,
                             image_paths,
                             status: TaskStatus::Pending,
                             labels: HashMap::new(),
-                        },
-                    );
+                        });
                     self.pending_queue.push_back(batch_id);
                 }
                 if batch_id >= self.next_batch_id {
@@ -132,8 +129,8 @@ impl StateMachine {
                 agent_id,
                 assigned_at,
             } => {
-                if let Some(batch) = self.tasks.get_mut(&batch_id) {
-                    if batch.status == TaskStatus::Pending {
+                if let Some(batch) = self.tasks.get_mut(&batch_id)
+                    && batch.status == TaskStatus::Pending {
                         batch.status = TaskStatus::Assigned {
                             agent_id,
                             assigned_at,
@@ -144,12 +141,11 @@ impl StateMachine {
                         }
                     }
                     // Already Assigned or Completed — no-op (idempotent).
-                }
             }
 
             Command::CompleteTask { batch_id, labels } => {
-                if let Some(batch) = self.tasks.get_mut(&batch_id) {
-                    if batch.status != TaskStatus::Completed {
+                if let Some(batch) = self.tasks.get_mut(&batch_id)
+                    && batch.status != TaskStatus::Completed {
                         let image_count = labels.len() as u64;
                         // Track which agent completed this batch.
                         if let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
@@ -170,12 +166,11 @@ impl StateMachine {
                         self.last_completion_at = Some(now);
                     }
                     // Already Completed — no-op (idempotent).
-                }
             }
 
             Command::ExpireTask { batch_id } => {
-                if let Some(batch) = self.tasks.get_mut(&batch_id) {
-                    if let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
+                if let Some(batch) = self.tasks.get_mut(&batch_id)
+                    && let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
                         *self
                             .per_agent_ttl_expirations
                             .entry(agent_id.clone())
@@ -184,13 +179,12 @@ impl StateMachine {
                         self.pending_queue.push_back(batch_id);
                         self.ttl_expirations += 1;
                     }
-                }
             }
 
             Command::ExpireTasks { batch_ids } => {
                 for batch_id in batch_ids {
-                    if let Some(batch) = self.tasks.get_mut(&batch_id) {
-                        if let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
+                    if let Some(batch) = self.tasks.get_mut(&batch_id)
+                        && let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
                             *self
                                 .per_agent_ttl_expirations
                                 .entry(agent_id.clone())
@@ -199,7 +193,6 @@ impl StateMachine {
                             self.pending_queue.push_back(batch_id);
                             self.ttl_expirations += 1;
                         }
-                    }
                 }
             }
 
@@ -229,11 +222,10 @@ impl StateMachine {
     /// O(1) amortized instead of O(n) linear scan.
     fn next_pending_batch(&mut self) -> Option<TaskBatch> {
         while let Some(&batch_id) = self.pending_queue.front() {
-            if let Some(batch) = self.tasks.get(&batch_id) {
-                if batch.status == TaskStatus::Pending {
+            if let Some(batch) = self.tasks.get(&batch_id)
+                && batch.status == TaskStatus::Pending {
                     return Some(batch.clone());
                 }
-            }
             self.pending_queue.pop_front();
         }
         None
@@ -244,11 +236,10 @@ impl StateMachine {
         self.tasks
             .values()
             .filter_map(|b| {
-                if let TaskStatus::Assigned { assigned_at, .. } = b.status {
-                    if now.saturating_sub(assigned_at) > ttl_secs {
+                if let TaskStatus::Assigned { assigned_at, .. } = b.status
+                    && now.saturating_sub(assigned_at) > ttl_secs {
                         return Some(b.batch_id);
                     }
-                }
                 None
             })
             .collect()

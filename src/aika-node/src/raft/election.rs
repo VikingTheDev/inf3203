@@ -90,12 +90,11 @@ impl ElectionTimer {
                     _ = sleep(deadline.saturating_duration_since(Instant::now())) => {
                         // Re-check: if reset_tx was updated after we read the
                         // borrow, the deadline moved and this is a stale wake.
-                        if Instant::now() >= deadline {
-                            if on_timeout.send(()).await.is_err() {
+                        if Instant::now() >= deadline
+                            && on_timeout.send(()).await.is_err() {
                                 // Receiver dropped — node is shutting down.
                                 break;
                             }
-                        }
                         // Otherwise loop again with a fresh timeout.
                     }
                     // A reset arrived — loop to recalculate the deadline.
@@ -228,7 +227,7 @@ where
 // region handling vote response
 
 /// Process a single `RequestVoteReply` received from `peer`.
-
+///
 /// Returns `true` when the node has just won the election (gathered a
 /// majority of votes for `election_term`), indicating the caller should call
 /// `become_leader`.

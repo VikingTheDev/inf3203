@@ -239,12 +239,11 @@ where
     if reply.success {
         let new_match_index = args.prev_log_index + entries_count;
         let mut state_guard = state.lock().await;
-        if let Some(ref mut leader_state) = state_guard.leader_state {
-            if let Some(peer_state) = leader_state.peers.get_mut(peer) {
+        if let Some(ref mut leader_state) = state_guard.leader_state
+            && let Some(peer_state) = leader_state.peers.get_mut(peer) {
                 peer_state.match_index = new_match_index;
                 peer_state.next_index = new_match_index + 1;
             }
-        }
         drop(state_guard);
         commit_notify.notify_one();
         return Ok(());
@@ -268,14 +267,13 @@ where
     // Falls back to decrement-by-one when no hint is available.
     {
         let mut state_guard = state.lock().await;
-        if let Some(ref mut leader_state) = state_guard.leader_state {
-            if let Some(peer_state) = leader_state.peers.get_mut(peer) {
+        if let Some(ref mut leader_state) = state_guard.leader_state
+            && let Some(peer_state) = leader_state.peers.get_mut(peer) {
                 peer_state.next_index = match reply.conflict_index {
                     Some(ci) => ci.max(1),
                     None => peer_state.next_index.saturating_sub(1).max(1),
                 };
             }
-        }
     }
 
     Ok(())

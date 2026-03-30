@@ -22,8 +22,10 @@ pub type LogIndex = u64;
 
 /// The role a Raft node currently occupies in the protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Role {
     /// Default starting role.
+    #[default]
     Follower,
 
     /// Temporarily held while gathering votes.
@@ -33,11 +35,6 @@ pub enum Role {
     Leader,
 }
 
-impl Default for Role {
-    fn default() -> Self {
-        Role::Follower
-    }
-}
 
 // endregion
 
@@ -46,6 +43,7 @@ impl Default for Role {
 /// Fields that **must** be persisted to stable storage before responding to any RPC.
 /// On recovery the node reloads these from disk.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub struct PersistentState {
     /// Latest term the server has seen.  Initialised to 0 and only ever increases.
     pub current_term: Term,
@@ -55,14 +53,6 @@ pub struct PersistentState {
     pub voted_for: Option<NodeId>,
 }
 
-impl Default for PersistentState {
-    fn default() -> Self {
-        PersistentState {
-            current_term: 0,
-            voted_for: None,
-        }
-    }
-}
 
 /// Fields kept in memory on every node. Safe to re-derive after a crash.
 #[derive(Debug, Clone, Default)]
